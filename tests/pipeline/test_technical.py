@@ -27,15 +27,6 @@ from zipline.testing.predicates import assert_equal
 from .base import BasePipelineTestCase
 
 
-class BollingerBandsTestCase(BasePipelineTestCase):
-
-    def closes(self, mask_last_sid):
-        data = self.arange_data(dtype=np.float64)
-        if mask_last_sid:
-            data[:, -1] = np.nan
-        return data
-
-
 class TestWilliamsR(ZiplineTestCase):
 
     def test_willr(self):
