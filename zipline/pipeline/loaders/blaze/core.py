@@ -175,19 +175,20 @@ from zipline.pipeline.common import (
 from zipline.pipeline.data.dataset import DataSet, Column
 from zipline.pipeline.loaders.utils import (
     check_data_query_args,
+    last_in_date_group,
     normalize_data_query_bounds,
     normalize_timestamp_to_query_time,
+    ffill_across_cols
 )
 from zipline.pipeline.sentinels import NotSpecified
 from zipline.lib.adjusted_array import AdjustedArray, can_represent_dtype
-from zipline.lib.adjustment import Float64Overwrite
+from zipline.lib.adjustment import make_adjustment_from_indices, OVERWRITE
 from zipline.utils.input_validation import (
     expect_element,
     ensure_timezone,
     optionally,
 )
-from zipline.utils.numpy_utils import bool_dtype, categorical_dtype
-from zipline.utils.pandas_utils import sort_values
+from zipline.utils.numpy_utils import bool_dtype
 from zipline.utils.pool import SequentialPool
 from zipline.utils.preprocess import preprocess
 
@@ -205,8 +206,13 @@ is_invalid_deltas_node = complement(flip(isinstance, valid_deltas_node_types))
 get__name__ = op.attrgetter('__name__')
 
 
-class ExprData(namedtuple('ExprData', 'expr deltas checkpoints odo_kwargs')):
-    """A pair of expressions and data resources. The expresions will be
+_expr_data_base = namedtuple(
+    'ExprData', 'expr deltas checkpoints odo_kwargs apply_deltas_adjustments'
+)
+
+
+class ExprData(_expr_data_base):
+    """A pair of expressions and data resources. The expressions will be
     computed using the resources as the starting scope.
 
     Parameters
@@ -219,14 +225,23 @@ class ExprData(namedtuple('ExprData', 'expr deltas checkpoints odo_kwargs')):
         The forward fill checkpoints for the data.
     odo_kwargs : dict, optional
         The keyword arguments to forward to the odo calls internally.
+    apply_deltas_adjustments : bool, optional
+        Whether or not deltas adjustments should be applied to the baseline
+        values. If False, only novel deltas will be applied.
     """
-    def __new__(cls, expr, deltas=None, checkpoints=None, odo_kwargs=None):
+    def __new__(cls,
+                expr,
+                deltas=None,
+                checkpoints=None,
+                odo_kwargs=None,
+                apply_deltas_adjustments=True):
         return super(ExprData, cls).__new__(
             cls,
             expr,
             deltas,
             checkpoints,
             odo_kwargs or {},
+            apply_deltas_adjustments,
         )
 
     def __repr__(self):
@@ -238,6 +253,7 @@ class ExprData(namedtuple('ExprData', 'expr deltas checkpoints odo_kwargs')):
             str(self.deltas),
             str(self.checkpoints),
             self.odo_kwargs,
+            self.apply_deltas_adjustments,
         ))
 
 
@@ -546,7 +562,8 @@ def from_blaze(expr,
                odo_kwargs=None,
                missing_values=None,
                no_deltas_rule='warn',
-               no_checkpoints_rule='warn'):
+               no_checkpoints_rule='warn',
+               apply_deltas_adjustments=True,):
     """Create a Pipeline API object from a blaze expression.
 
     Parameters
@@ -559,7 +576,7 @@ def from_blaze(expr,
         by stepping up the expression tree and looking for another field
         with the name of ``expr._name`` + '_deltas'. If None is passed, no
         deltas will be used.
-    deltas : Expr, 'auto' or None, optional
+    checkpoints : Expr, 'auto' or None, optional
         The expression to use for the forward fill checkpoints.
         If the string 'auto' is passed, a checkpoints expr will be looked up
         by stepping up the expression tree and looking for another field
@@ -586,6 +603,10 @@ def from_blaze(expr,
         found. 'warn' says to raise a warning but continue.
         'raise' says to raise an exception if no deltas can be found.
         'ignore' says take no action and proceed with no deltas.
+    apply_deltas_adjustments : bool, optional
+        Whether or not deltas adjustments should be applied for this dataset.
+        True by default because not applying deltas adjustments is an exception
+        rather than the rule.
 
     Returns
     -------
@@ -713,6 +734,7 @@ def from_blaze(expr,
         if checkpoints is not None else
         None,
         odo_kwargs=odo_kwargs,
+        apply_deltas_adjustments=apply_deltas_adjustments
     )
     if single_column is not None:
         # We were passed a single column, extract and return it.
@@ -754,12 +776,12 @@ def overwrite_novel_deltas(baseline, deltas, dates):
         ignore_index=True,
         copy=False,
     )
-    sort_values(cat, TS_FIELD_NAME, inplace=True)
+    cat.sort_values(TS_FIELD_NAME, inplace=True)
     return cat, non_novel_deltas
 
 
 def overwrite_from_dates(asof, dense_dates, sparse_dates, asset_idx, value):
-    """Construct a `Float64Overwrite` with the correct
+    """Construct an Overwrite with the correct
     start and end date based on the asof date of the delta,
     the dense_dates, and the dense_dates.
 
@@ -774,7 +796,7 @@ def overwrite_from_dates(asof, dense_dates, sparse_dates, asset_idx, value):
     asset_idx : tuple of int
         The index of the asset in the block. If this is a tuple, then this
         is treated as the first and last index to use.
-    value : np.float64
+    value : any
         The value to overwrite with.
 
     Returns
@@ -814,7 +836,9 @@ def overwrite_from_dates(asof, dense_dates, sparse_dates, asset_idx, value):
         return
 
     first, last = asset_idx
-    yield Float64Overwrite(first_row, last_row, first, last, value)
+    yield make_adjustment_from_indices(
+        first_row, last_row, first, last, OVERWRITE, value
+    )
 
 
 def adjustments_from_deltas_no_sids(dense_dates,
@@ -870,9 +894,9 @@ def adjustments_from_deltas_with_sids(dense_dates,
 
     Parameters
     ----------
-    dates : pd.DatetimeIndex
-        The dates requested by the loader.
     dense_dates : pd.DatetimeIndex
+        The dates requested by the loader.
+    sparse_dates : pd.DatetimeIndex
         The dates that were in the raw data.
     column_idx : int
         The index of the column in the dataset.
@@ -983,14 +1007,17 @@ class BlazeLoader(dict):
         except ValueError:
             raise AssertionError('all columns must come from the same dataset')
 
-        expr, deltas, checkpoints, odo_kwargs = self[dataset]
+        expr, deltas, checkpoints, odo_kwargs, apply_deltas_adjustments = self[
+            dataset
+        ]
         have_sids = (dataset.ndim == 2)
         asset_idx = pd.Series(index=assets, data=np.arange(len(assets)))
         assets = list(map(int, assets))  # coerce from numpy.int64
-        added_query_fields = [AD_FIELD_NAME, TS_FIELD_NAME] + (
-            [SID_FIELD_NAME] if have_sids else []
+        added_query_fields = {AD_FIELD_NAME, TS_FIELD_NAME} | (
+            {SID_FIELD_NAME} if have_sids else set()
         )
-        colnames = added_query_fields + list(map(getname, columns))
+        requested_columns = set(map(getname, columns))
+        colnames = sorted(added_query_fields | requested_columns)
 
         data_query_time = self._data_query_time
         data_query_tz = self._data_query_tz
@@ -1027,22 +1054,9 @@ class BlazeLoader(dict):
 
             return odo(e[predicate][colnames], pd.DataFrame, **odo_kwargs)
 
-        if checkpoints is not None:
-            ts = checkpoints[TS_FIELD_NAME]
-            checkpoints_ts = odo(ts[ts <= lower_dt].max(), pd.Timestamp)
-            if pd.isnull(checkpoints_ts):
-                materialized_checkpoints = pd.DataFrame(columns=colnames)
-                lower = None
-            else:
-                materialized_checkpoints = odo(
-                    checkpoints[ts == checkpoints_ts][colnames],
-                    pd.DataFrame,
-                    **odo_kwargs
-                )
-                lower = checkpoints_ts
-        else:
-            materialized_checkpoints = pd.DataFrame(columns=colnames)
-            lower = None
+        lower, materialized_checkpoints = get_materialized_checkpoints(
+            checkpoints, colnames, lower_dt, odo_kwargs
+        )
 
         materialized_expr = self.pool.apply_async(collect_expr, (expr, lower))
         materialized_deltas = (
@@ -1090,82 +1104,42 @@ class BlazeLoader(dict):
             materialized_deltas,
             dates,
         )
-        sparse_output.drop(AD_FIELD_NAME, axis=1, inplace=True)
+        # If we ever have cases where we find out about multiple asof_dates'
+        # data on the same TS, we want to make sure that last_in_date_group
+        # selects the correct last asof_date's value.
+        sparse_output.sort_values(AD_FIELD_NAME, inplace=True)
+        non_novel_deltas.sort_values(AD_FIELD_NAME, inplace=True)
+        if AD_FIELD_NAME not in requested_columns:
+            sparse_output.drop(AD_FIELD_NAME, axis=1, inplace=True)
 
-        def last_in_date_group(df, reindex, have_sids=have_sids):
-            idx = dates[dates.searchsorted(
-                df[TS_FIELD_NAME].values.astype('datetime64[D]')
-            )]
-            if have_sids:
-                idx = [idx, SID_FIELD_NAME]
+        sparse_deltas = last_in_date_group(non_novel_deltas,
+                                           dates,
+                                           assets,
+                                           reindex=False,
+                                           have_sids=have_sids)
+        dense_output = last_in_date_group(sparse_output,
+                                          dates,
+                                          assets,
+                                          reindex=True,
+                                          have_sids=have_sids)
+        ffill_across_cols(dense_output, columns, {c.name: c.name
+                                                  for c in columns})
 
-            last_in_group = df.drop(TS_FIELD_NAME, axis=1).groupby(
-                idx,
-                sort=False,
-            ).last()
+        # By default, no non-novel deltas are applied.
+        def no_adjustments_from_deltas(*args):
+            return {}
 
-            if have_sids:
-                last_in_group = last_in_group.unstack()
-
-            if reindex:
-                if have_sids:
-                    cols = last_in_group.columns
-                    last_in_group = last_in_group.reindex(
-                        index=dates,
-                        columns=pd.MultiIndex.from_product(
-                            (cols.levels[0], assets),
-                            names=cols.names,
-                        ),
-                    )
-                else:
-                    last_in_group = last_in_group.reindex(dates)
-
-            return last_in_group
-
-        sparse_deltas = last_in_date_group(non_novel_deltas, reindex=False)
-        dense_output = last_in_date_group(sparse_output, reindex=True)
-        dense_output.ffill(inplace=True)
-
-        # Fill in missing values specified by each column. This is made
-        # significantly more complex by the fact that we need to work around
-        # two pandas issues:
-
-        # 1) When we have sids, if there are no records for a given sid for any
-        #    dates, pandas will generate a column full of NaNs for that sid.
-        #    This means that some of the columns in `dense_output` are now
-        #    float instead of the intended dtype, so we have to coerce back to
-        #    our expected type and convert NaNs into the desired missing value.
-
-        # 2) DataFrame.ffill assumes that receiving None as a fill-value means
-        #    that no value was passed.  Consequently, there's no way to tell
-        #    pandas to replace NaNs in an object column with None using fillna,
-        #    so we have to roll our own instead using df.where.
-        for column in columns:
-            # Special logic for strings since `fillna` doesn't work if the
-            # missing value is `None`.
-            if column.dtype == categorical_dtype:
-                dense_output[column.name] = dense_output[
-                    column.name
-                ].where(pd.notnull(dense_output[column.name]),
-                        column.missing_value)
-            else:
-                # We need to execute `fillna` before `astype` in case the
-                # column contains NaNs and needs to be cast to bool or int.
-                # This is so that the NaNs are replaced first, since pandas
-                # can't convert NaNs for those types.
-                dense_output[column.name] = dense_output[
-                    column.name
-                ].fillna(column.missing_value).astype(column.dtype)
-
+        adjustments_from_deltas = no_adjustments_from_deltas
         if have_sids:
-            adjustments_from_deltas = adjustments_from_deltas_with_sids
+            if apply_deltas_adjustments:
+                adjustments_from_deltas = adjustments_from_deltas_with_sids
             column_view = identity
         else:
             # If we do not have sids, use the column view to make a single
             # column vector which is unassociated with any assets.
             column_view = op.itemgetter(np.s_[:, np.newaxis])
-
-            adjustments_from_deltas = adjustments_from_deltas_no_sids
+            if apply_deltas_adjustments:
+                adjustments_from_deltas = adjustments_from_deltas_no_sids
             mask = np.full(
                 shape=(len(mask), 1), fill_value=True, dtype=bool_dtype,
             )
@@ -1188,6 +1162,7 @@ class BlazeLoader(dict):
             )
             for column_idx, column in enumerate(columns)
         }
+
 
 global_loader = BlazeLoader.global_instance()
 
@@ -1220,12 +1195,54 @@ def bind_expression_to_resources(expr, resources):
     })
 
 
+def get_materialized_checkpoints(checkpoints, colnames, lower_dt, odo_kwargs):
+    """
+    Computes a lower bound and a DataFrame checkpoints.
+
+    Parameters
+    ----------
+    checkpoints : Expr
+        Bound blaze expression for a checkpoints table from which to get a
+        computed lower bound.
+    colnames : iterable of str
+        The names of the columns for which checkpoints should be computed.
+    lower_dt : pd.Timestamp
+        The lower date being queried for that serves as an upper bound for
+        checkpoints.
+    odo_kwargs : dict, optional
+        The extra keyword arguments to pass to ``odo``.
+    """
+    if checkpoints is not None:
+        ts = checkpoints[TS_FIELD_NAME]
+        checkpoints_ts = odo(
+            ts[ts <= lower_dt].max(),
+            pd.Timestamp,
+            **odo_kwargs
+        )
+        if pd.isnull(checkpoints_ts):
+            # We don't have a checkpoint for before our start date so just
+            # don't constrain the lower date.
+            materialized_checkpoints = pd.DataFrame(columns=colnames)
+            lower = None
+        else:
+            materialized_checkpoints = odo(
+                checkpoints[ts == checkpoints_ts][colnames],
+                pd.DataFrame,
+                **odo_kwargs
+            )
+            lower = checkpoints_ts
+    else:
+        materialized_checkpoints = pd.DataFrame(columns=colnames)
+        lower = None  # we don't have a good lower date constraint
+    return lower, materialized_checkpoints
+
+
 def ffill_query_in_range(expr,
                          lower,
                          upper,
+                         checkpoints=None,
                          odo_kwargs=None,
-                         ts_field=TS_FIELD_NAME,
-                         sid_field=SID_FIELD_NAME):
+                         ts_field=TS_FIELD_NAME):
     """Query a blaze expression in a given time range properly forward filling
     from values that fall before the lower date.
 
@@ -1237,12 +1254,13 @@ def ffill_query_in_range(expr,
         The lower date to query for.
     upper : datetime
         The upper date to query for.
+    checkpoints : Expr, optional
+        Bound blaze expression for a checkpoints table from which to get a
+        computed lower bound.
     odo_kwargs : dict, optional
         The extra keyword arguments to pass to ``odo``.
     ts_field : str, optional
         The name of the timestamp field in the given blaze expression.
-    sid_field : str, optional
-        The name of the sid field in the given blaze expression.
 
     Returns
     -------
@@ -1251,27 +1269,29 @@ def ffill_query_in_range(expr,
         start before the requested start date if a value is needed to ffill.
     """
     odo_kwargs = odo_kwargs or {}
-    filtered = expr[expr[ts_field] <= lower]
-    computed_lower = odo(
-        bz.by(
-            filtered[sid_field],
-            timestamp=filtered[ts_field].max(),
-        ).timestamp.min(),
-        pd.Timestamp,
-        **odo_kwargs
+    computed_lower, materialized_checkpoints = get_materialized_checkpoints(
+        checkpoints,
+        expr.fields,
+        lower,
+        odo_kwargs,
     )
-    if pd.isnull(computed_lower):
-        # If there is no lower date, just query for data in the date
-        # range. It must all be null anyways.
-        computed_lower = lower
 
-    raw = odo(
-        expr[
-            (expr[ts_field] >= computed_lower) &
-            (expr[ts_field] <= upper)
-        ],
-        pd.DataFrame,
-        **odo_kwargs
+    pred = expr[ts_field] <= upper
+
+    if computed_lower is not None:
+        # only constrain the lower date if we computed a new lower date
+        pred &= expr[ts_field] >= computed_lower
+
+    raw = pd.concat(
+        (
+            materialized_checkpoints,
+            odo(
+                expr[pred],
+                pd.DataFrame,
+                **odo_kwargs
+            ),
+        ),
+        ignore_index=True,
     )
     raw.loc[:, ts_field] = raw.loc[:, ts_field].astype('datetime64[ns]')
     return raw

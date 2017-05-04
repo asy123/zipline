@@ -32,11 +32,31 @@ if PY2:
                 except IndexError:
                     self.step = 1
 
+            if self.step == 0:
+                raise ValueError('range step must not be zero')
+
         def __iter__(self):
+            """
+            Examples
+            --------
+            >>> list(range(1))
+            [0]
+            >>> list(range(5))
+            [0, 1, 2, 3, 4]
+            >>> list(range(1, 5))
+            [1, 2, 3, 4]
+            >>> list(range(0, 5, 2))
+            [0, 2, 4]
+            >>> list(range(5, 0, -1))
+            [5, 4, 3, 2, 1]
+            >>> list(range(5, 0, 1))
+            []
+            """
             n = self.start
             stop = self.stop
             step = self.step
-            while n < stop:
+            cmp_ = op.lt if step > 0 else op.gt
+            while cmp_(n, stop):
                 yield n
                 n += step
 
@@ -46,6 +66,8 @@ if PY2:
         )
 
         def __contains__(self, other, _ops=_ops):
+            # Algorithm taken from CPython
+            # Objects/rangeobject.c:range_contains_long
             start = self.start
             step = self.step
             cmp_start, cmp_stop = _ops[step > 0]
@@ -57,12 +79,70 @@ if PY2:
 
         del _ops
 
+        def __len__(self):
+            """
+            Examples
+            --------
+            >>> len(range(1))
+            1
+            >>> len(range(5))
+            5
+            >>> len(range(1, 5))
+            4
+            >>> len(range(0, 5, 2))
+            3
+            >>> len(range(5, 0, -1))
+            5
+            >>> len(range(5, 0, 1))
+            0
+            """
+            # Algorithm taken from CPython
+            # rangeobject.c:compute_range_length
+            step = self.step
+
+            if step > 0:
+                low = self.start
+                high = self.stop
+            else:
+                low = self.stop
+                high = self.start
+                step = -step
+
+            if low >= high:
+                return 0
+
+            return (high - low - 1) // step + 1
+
         def __repr__(self):
             return '%s(%s, %s%s)' % (
                 type(self).__name__,
                 self.start,
                 self.stop,
                 (', ' + str(self.step)) if self.step != 1 else '',
+            )
+
+        def __hash__(self):
+            return hash((type(self), self.start, self.stop, self.step))
+
+        def __eq__(self, other):
+            """
+            Examples
+            --------
+            >>> range(1) == range(1)
+            True
+            >>> range(0, 5, 2) == range(0, 5, 2)
+            True
+            >>> range(5, 0, -2) == range(5, 0, -2)
+            True
+
+            >>> range(1) == range(2)
+            False
+            >>> range(0, 5, 2) == range(0, 5, 3)
+            False
+            """
+            return all(
+                getattr(self, attr) == getattr(other, attr)
+                for attr in self.__slots__
             )
 else:
     range = range

@@ -29,8 +29,6 @@ from nose.tools import (  # noqa
     assert_raises,
     assert_raises_regexp,
     assert_regexp_matches,
-    assert_sequence_equal,
-    assert_set_equal,
     assert_true,
     assert_tuple_equal,
 )
@@ -40,6 +38,7 @@ from pandas.util.testing import (
     assert_frame_equal,
     assert_panel_equal,
     assert_series_equal,
+    assert_index_equal,
 )
 from six import iteritems, viewkeys, PY2
 from toolz import dissoc, keyfilter
@@ -48,6 +47,7 @@ import toolz.curried.operator as op
 from zipline.testing.core import ensure_doctest
 from zipline.dispatch import dispatch
 from zipline.lib.adjustment import Adjustment
+from zipline.lib.labelarray import LabelArray
 from zipline.utils.functional import dzip_exact, instance
 from zipline.utils.math_utils import tolerant_equals
 
@@ -101,6 +101,8 @@ def keywords(func):
     """
     if isinstance(func, type):
         return keywords(func.__init__)
+    elif isinstance(func, partial):
+        return keywords(func.func)
     return inspect.getargspec(func).args
 
 
@@ -302,36 +304,53 @@ def assert_float_equal(result,
     )
 
 
-@assert_equal.register(dict, dict)
-def assert_dict_equal(result, expected, path=(), msg='', **kwargs):
-    if path is None:
-        path = ()
+def _check_sets(result, expected, msg, path, type_):
+    """Compare two sets. This is used to check dictionary keys and sets.
 
-    result_keys = viewkeys(result)
-    expected_keys = viewkeys(expected)
-    if result_keys != expected_keys:
-        if result_keys > expected_keys:
-            diff = result_keys - expected_keys
-            msg = 'extra %s in result: %r' % (_s('key', diff), diff)
-        elif result_keys < expected_keys:
-            diff = expected_keys - result_keys
-            msg = 'result is missing %s: %r' % (_s('key', diff), diff)
+    Parameters
+    ----------
+    result : set
+    expected : set
+    msg : str
+    path : tuple
+    type : str
+        The type of an element. For dict we use ``'key'`` and for set we use
+        ``'element'``.
+    """
+    if result != expected:
+        if result > expected:
+            diff = result - expected
+            msg = 'extra %s in result: %r' % (_s(type_, diff), diff)
+        elif result < expected:
+            diff = expected - result
+            msg = 'result is missing %s: %r' % (_s(type_, diff), diff)
         else:
-            sym = result_keys ^ expected_keys
-            in_result = sym - expected_keys
-            in_expected = sym - result_keys
+            in_result = result - expected
+            in_expected = expected - result
             msg = '%s only in result: %s\n%s only in expected: %s' % (
-                _s('key', in_result),
+                _s(type_, in_result),
                 in_result,
-                _s('key', in_expected),
+                _s(type_, in_expected),
                 in_expected,
             )
         raise AssertionError(
-            '%sdict keys do not match\n%s' % (
+            '%s%ss do not match\n%s' % (
                 _fmt_msg(msg),
-                _fmt_path(path + ('.%s()' % ('viewkeys' if PY2 else 'keys'),)),
+                type_,
+                _fmt_path(path),
             ),
         )
+
+
+@assert_equal.register(dict, dict)
+def assert_dict_equal(result, expected, path=(), msg='', **kwargs):
+    _check_sets(
+        viewkeys(result),
+        viewkeys(expected),
+        msg,
+        path + ('.%s()' % ('viewkeys' if PY2 else 'keys'),),
+        'key',
+    )
 
     failures = []
     for k, (resultv, expectedv) in iteritems(dzip_exact(result, expected)):
@@ -350,19 +369,20 @@ def assert_dict_equal(result, expected, path=(), msg='', **kwargs):
         raise AssertionError('\n'.join(failures))
 
 
-@assert_equal.register(list, list)  # noqa
-def assert_list_equal(result, expected, path=(), msg='', **kwargs):
+@assert_equal.register(list, list)
+@assert_equal.register(tuple, tuple)
+def assert_sequence_equal(result, expected, path=(), msg='', **kwargs):
     result_len = len(result)
     expected_len = len(expected)
     assert result_len == expected_len, (
-        '%slist lengths do not match: %d != %d\n%s' % (
+        '%s%s lengths do not match: %d != %d\n%s' % (
             _fmt_msg(msg),
+            type(result).__name__,
             result_len,
             expected_len,
             _fmt_path(path),
         )
     )
-
     for n, (resultv, expectedv) in enumerate(zip(result, expected)):
         assert_equal(
             resultv,
@@ -371,6 +391,17 @@ def assert_list_equal(result, expected, path=(), msg='', **kwargs):
             msg=msg,
             **kwargs
         )
+
+
+@assert_equal.register(set, set)
+def assert_set_equal(result, expected, path=(), msg='', **kwargs):
+    _check_sets(
+        result,
+        expected,
+        msg,
+        path,
+        'element',
+    )
 
 
 @assert_equal.register(np.ndarray, np.ndarray)
@@ -397,7 +428,23 @@ def assert_array_equal(result,
         raise AssertionError('\n'.join((str(e), _fmt_path(path))))
 
 
-def _register_assert_ndframe_equal(type_, assert_eq):
+@assert_equal.register(LabelArray, LabelArray)
+def assert_labelarray_equal(result, expected, path=(), **kwargs):
+    assert_equal(
+        result.categories,
+        expected.categories,
+        path=path + ('.categories',),
+        **kwargs
+    )
+    assert_equal(
+        result.as_int_array(),
+        expected.as_int_array(),
+        path=path + ('.as_int_array()',),
+        **kwargs
+    )
+
+
+def _register_assert_equal_wrapper(type_, assert_eq):
     """Register a new check for an ndframe object.
 
     Parameters
@@ -418,7 +465,7 @@ def _register_assert_ndframe_equal(type_, assert_eq):
             assert_eq(
                 result,
                 expected,
-                **filter_kwargs(assert_frame_equal, kwargs)
+                **filter_kwargs(assert_eq, kwargs)
             )
         except AssertionError as e:
             raise AssertionError(
@@ -428,18 +475,40 @@ def _register_assert_ndframe_equal(type_, assert_eq):
     return assert_ndframe_equal
 
 
-assert_frame_equal = _register_assert_ndframe_equal(
+assert_frame_equal = _register_assert_equal_wrapper(
     pd.DataFrame,
     assert_frame_equal,
 )
-assert_panel_equal = _register_assert_ndframe_equal(
+assert_panel_equal = _register_assert_equal_wrapper(
     pd.Panel,
     assert_panel_equal,
 )
-assert_series_equal = _register_assert_ndframe_equal(
+assert_series_equal = _register_assert_equal_wrapper(
     pd.Series,
     assert_series_equal,
 )
+assert_index_equal = _register_assert_equal_wrapper(
+    pd.Index,
+    assert_index_equal,
+)
+
+
+@assert_equal.register(pd.Categorical, pd.Categorical)
+def assert_categorical_equal(result, expected, path=(), msg='', **kwargs):
+    assert_equal(
+        result.categories,
+        expected.categories,
+        path=path + ('.categories',),
+        msg=msg,
+        **kwargs
+    )
+    assert_equal(
+        result.codes,
+        expected.codes,
+        path=path + ('.codes',),
+        msg=msg,
+        **kwargs
+    )
 
 
 @assert_equal.register(Adjustment, Adjustment)
@@ -490,6 +559,32 @@ def assert_timestamp_and_datetime_equal(result,
         expected,
         path=path,
         **kwargs
+    )
+
+
+@assert_equal.register(slice, slice)
+def assert_slice_equal(result, expected, path=(), msg=''):
+    diff_start = (
+        ('starts are not equal: %s != %s' % (result.start, result.stop))
+        if result.start != expected.start else
+        ''
+    )
+    diff_stop = (
+        ('stops are not equal: %s != %s' % (result.stop, result.stop))
+        if result.stop != expected.stop else
+        ''
+    )
+    diff_step = (
+        ('steps are not equal: %s != %s' % (result.step, result.stop))
+        if result.step != expected.step else
+        ''
+    )
+    diffs = diff_start, diff_stop, diff_step
+
+    assert not any(diffs), '%s%s\n%s' % (
+        _fmt_msg(msg),
+        '\n'.join(filter(None, diffs)),
+        _fmt_path(path),
     )
 
 

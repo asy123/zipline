@@ -4,11 +4,12 @@ factor.py
 from functools import wraps
 from operator import attrgetter
 from numbers import Number
+from math import ceil
 
 from numpy import empty_like, inf, nan, where
 from scipy.stats import rankdata
 
-from zipline.errors import UnknownRankMethod
+from zipline.errors import BadPercentileBounds, UnknownRankMethod
 from zipline.lib.normalize import naive_grouped_rowwise_apply
 from zipline.lib.rank import masked_rankdata_2d, rankdata_1d_descending
 from zipline.pipeline.api_utils import restrict_to_dtype
@@ -32,7 +33,9 @@ from zipline.pipeline.filters import (
     NullFilter,
 )
 from zipline.pipeline.mixins import (
+    AliasedMixin,
     CustomTermMixin,
+    DownsampledMixin,
     LatestMixin,
     PositiveWindowLengthMixin,
     RestrictedDTypeMixin,
@@ -43,6 +46,7 @@ from zipline.pipeline.term import ComputableTerm, Term
 from zipline.utils.functional import with_doc, with_name
 from zipline.utils.input_validation import expect_types
 from zipline.utils.math_utils import nanmean, nanstd
+from zipline.utils.memoize import classlazyval
 from zipline.utils.numpy_utils import (
     bool_dtype,
     categorical_dtype,
@@ -507,6 +511,7 @@ class Factor(RestrictedDTypeMixin, ComputableTerm):
             groupby=groupby,
             dtype=self.dtype,
             missing_value=self.missing_value,
+            window_safe=self.window_safe,
             mask=mask,
         )
 
@@ -574,6 +579,7 @@ class Factor(RestrictedDTypeMixin, ComputableTerm):
             dtype=self.dtype,
             missing_value=self.missing_value,
             mask=mask,
+            window_safe=True,
         )
 
     def rank(self,
@@ -783,8 +789,8 @@ class Factor(RestrictedDTypeMixin, ComputableTerm):
         target : zipline.pipeline.Term with a numeric dtype
             The term to use as the predictor/independent variable in each
             regression. This may be a Factor, a BoundColumn or a Slice. If
-            `target` is two-dimensional, correlations are computed asset-wise.
-        correlation_length : int
+            `target` is two-dimensional, regressions are computed asset-wise.
+        regression_length : int
             Length of the lookback window over which to compute each
             regression.
         mask : zipline.pipeline.Filter, optional
@@ -826,6 +832,104 @@ class Factor(RestrictedDTypeMixin, ComputableTerm):
             independent=target,
             regression_length=regression_length,
             mask=mask,
+        )
+
+    @expect_types(
+        min_percentile=(int, float),
+        max_percentile=(int, float),
+        mask=(Filter, NotSpecifiedType),
+        groupby=(Classifier, NotSpecifiedType),
+    )
+    @float64_only
+    def winsorize(self,
+                  min_percentile,
+                  max_percentile,
+                  mask=NotSpecified,
+                  groupby=NotSpecified):
+        """
+        Construct a Factor returns a winsorized row. Winsorizing changes values
+        ranked less than the minimum percentile to to value at the minimum
+        percentile. Similarly, values ranking above the maximum percentile will
+        be changed to the value at the maximum percentile. This is useful
+        when limiting the impact of extreme values.
+
+        If ``mask`` is supplied, ignore values where ``mask`` returns False
+        when computing row means and standard deviations, and output NaN
+        anywhere the mask is False.
+
+        If ``groupby`` is supplied, compute by partitioning each row based on
+        the values produced by ``groupby``, winsorizing the partitioned arrays,
+        and stitching the sub-results back together.
+
+        Parameters
+        ----------
+        min_percentile: float, int
+            Entries with values at or below this percentile will be replaced
+            with the (len(inp) * min_percentile)th lowest value. If low values
+            should not be clipped, use 0.
+        max_percentile: float, int
+            Entries with values at or above this percentile will be replaced
+            with the (len(inp) * max_percentile)th lowest value. If high
+            values should not be clipped, use 1.
+        mask : zipline.pipeline.Filter, optional
+            A Filter defining values to ignore when winsorizing.
+        groupby : zipline.pipeline.Classifier, optional
+            A classifier defining partitions over which to winsorize.
+
+        Returns
+        -------
+        winsorized : zipline.pipeline.Factor
+            A Factor producing a winsorized version of self.
+
+        Example
+        -------
+
+        price = USEquityPricing.close.latest
+        columns={
+            'PRICE': price,
+            'WINSOR_1: price.winsorize(
+                min_percentile=0.25, max_percentile=0.75
+            ),
+            'WINSOR_2': price.winsorize(
+                min_percentile=0.50, max_percentile=1.0
+            ),
+            'WINSOR_3': price.winsorize(
+                min_percentile=0.0, max_percentile=0.5
+            ),
+
+        }
+
+        Given a pipeline with columns, defined above, the result for a
+        given day could look like:
+
+                'PRICE' 'WINSOR_1' 'WINSOR_2' 'WINSOR_3'
+        Asset_1    1        2          4          3
+        Asset_2    2        2          4          3
+        Asset_3    3        3          4          3
+        Asset_4    4        4          4          4
+        Asset_5    5        5          5          4
+        Asset_6    6        5          5          4
+
+        See Also
+        --------
+        :func:`scipy.stats.mstats.winsorize`
+        :meth:`pandas.DataFrame.groupby`
+        """
+        if not 0.0 <= min_percentile < max_percentile <= 1.0:
+            raise BadPercentileBounds(
+                min_percentile=min_percentile,
+                max_percentile=max_percentile,
+                upper_bound=1.0,
+            )
+        return GroupedRowTransform(
+            transform=winsorize,
+            transform_args=(min_percentile, max_percentile),
+            factor=self,
+            groupby=groupby,
+            dtype=self.dtype,
+            missing_value=self.missing_value,
+            mask=mask,
+            window_safe=self.window_safe,
         )
 
     @expect_types(bins=int, mask=(Filter, NotSpecifiedType))
@@ -1069,6 +1173,14 @@ class Factor(RestrictedDTypeMixin, ComputableTerm):
         NaN, inf, or -inf.
         """
         return (-inf < self) & (self < inf)
+
+    @classlazyval
+    def _downsampled_type(self):
+        return DownsampledMixin.make_downsampled_type(Factor)
+
+    @classlazyval
+    def _aliased_type(self):
+        return AliasedMixin.make_aliased_type(Factor)
 
 
 class NumExprFactor(NumericalExpression, Factor):
@@ -1467,7 +1579,9 @@ class CustomFactor(PositiveWindowLengthMixin, CustomTermMixin, Factor):
 
 
 class RecarrayField(SingleInputMixin, Factor):
-
+    """
+    A single field from a multi-output factor.
+    """
     def __new__(cls, factor, attribute):
         return super(RecarrayField, cls).__new__(
             cls,
@@ -1515,3 +1629,23 @@ def demean(row):
 
 def zscore(row):
     return (row - nanmean(row)) / nanstd(row)
+
+
+def winsorize(row, min_percentile, max_percentile):
+    """
+    This implementation is based on scipy.stats.mstats.winsorize
+    """
+    a = row.copy()
+    num = a.size
+    idx = a.argsort()
+    if min_percentile > 0:
+        lowidx = int(min_percentile * num)
+        a[idx[:lowidx]] = a[idx[lowidx]]
+    if max_percentile < 1:
+        upidx = int(ceil(num * max_percentile))
+        # upidx could return as the length of the array, in this case
+        # no modification to the right tail is necessary.
+        if upidx < num:
+            a[idx[upidx:]] = a[idx[upidx - 1]]
+
+    return a

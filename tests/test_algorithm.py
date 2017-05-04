@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from collections import namedtuple
 import datetime
 from datetime import timedelta
 from textwrap import dedent
-import warnings
 from unittest import skip
 from copy import deepcopy
 
@@ -25,17 +25,20 @@ import toolz
 from logbook import TestHandler, WARNING
 from mock import MagicMock
 from nose_parameterized import parameterized
-from six import iteritems, itervalues
+from six import iteritems, itervalues, string_types
 from six.moves import range
 from testfixtures import TempDirectory
 
 import numpy as np
 import pandas as pd
 import pytz
+from pandas.core.common import PerformanceWarning
 
+from zipline import run_algorithm
 from zipline import TradingAlgorithm
 from zipline.api import FixedSlippage
-from zipline.assets import Equity, Future
+from zipline.assets import Equity, Future, Asset
+from zipline.assets.continuous_futures import ContinuousFuture
 from zipline.assets.synthetic import (
     make_jagged_equity_info,
     make_simple_equity_info,
@@ -51,17 +54,19 @@ from zipline.data.us_equity_pricing import (
     BcolzDailyBarWriter,
 )
 from zipline.errors import (
-    OrderDuringInitialize,
-    RegisterTradingControlPostInit,
-    TradingControlViolation,
     AccountControlViolation,
-    SymbolNotFound,
-    RootSymbolNotFound,
-    UnsupportedDatetimeFormat,
     CannotOrderDelistedAsset,
+    IncompatibleSlippageModel,
+    OrderDuringInitialize,
+    OrderInBeforeTradingStart,
+    RegisterTradingControlPostInit,
+    ScheduleFunctionInvalidCalendar,
     SetCancelPolicyPostInit,
+    SymbolNotFound,
+    TradingControlViolation,
     UnsupportedCancelPolicy,
-    OrderInBeforeTradingStart)
+    UnsupportedDatetimeFormat,
+)
 from zipline.api import (
     order,
     order_value,
@@ -75,6 +80,12 @@ from zipline.finance.commission import PerShare
 from zipline.finance.execution import LimitOrder
 from zipline.finance.order import ORDER_STATUS
 from zipline.finance.trading import SimulationParameters
+from zipline.finance.asset_restrictions import (
+    Restriction,
+    HistoricalRestrictions,
+    StaticRestrictions,
+    RESTRICTION_STATES,
+)
 from zipline.testing import (
     FakeDataPortal,
     create_daily_df_for_asset,
@@ -90,13 +101,14 @@ from zipline.testing import (
     to_utc,
     trades_by_sid_to_dfs,
 )
+from zipline.testing import RecordBatchBlotter
 from zipline.testing.fixtures import (
     WithDataPortal,
     WithLogger,
     WithSimParams,
     WithTradingEnvironment,
     WithTmpDir,
-    WithTradingCalendar,
+    WithTradingCalendars,
     ZiplineTestCase,
 )
 from zipline.test_algorithms import (
@@ -115,12 +127,15 @@ from zipline.test_algorithms import (
     TestTargetAlgorithm,
     TestTargetPercentAlgorithm,
     TestTargetValueAlgorithm,
+    TestBatchTargetPercentAlgorithm,
     SetLongOnlyAlgorithm,
     SetAssetDateBoundsAlgorithm,
     SetMaxPositionSizeAlgorithm,
     SetMaxOrderCountAlgorithm,
     SetMaxOrderSizeAlgorithm,
     SetDoNotOrderListAlgorithm,
+    SetAssetRestrictionsAlgorithm,
+    SetMultipleAssetRestrictionsAlgorithm,
     SetMaxLeverageAlgorithm,
     api_algo,
     api_get_environment_algo,
@@ -160,7 +175,9 @@ from zipline.test_algorithms import (
     set_benchmark_algo,
     no_handle_data,
 )
+from zipline.testing.predicates import assert_equal
 from zipline.utils.api_support import ZiplineAPI, set_algo_instance
+from zipline.utils.calendars import get_calendar, register_calendar
 from zipline.utils.context_tricks import CallbackManager
 from zipline.utils.control_flow import nullctx
 import zipline.utils.events
@@ -207,10 +224,12 @@ class TestMiscellaneousAPI(WithLogger,
             pd.DataFrame.from_dict(
                 {3: {'symbol': 'PLAY',
                      'start_date': '2002-01-01',
-                     'end_date': '2004-01-01'},
+                     'end_date': '2004-01-01',
+                     'exchange': 'TEST'},
                  4: {'symbol': 'PLAY',
                      'start_date': '2005-01-01',
-                     'end_date': '2006-01-01'}},
+                     'end_date': '2006-01-01',
+                     'exchange': 'TEST'}},
                 orient='index',
             ),
         ))
@@ -224,25 +243,33 @@ class TestMiscellaneousAPI(WithLogger,
                     'root_symbol': 'CL',
                     'start_date': pd.Timestamp('2005-12-01', tz='UTC'),
                     'notice_date': pd.Timestamp('2005-12-20', tz='UTC'),
-                    'expiration_date': pd.Timestamp('2006-01-20', tz='UTC')},
+                    'expiration_date': pd.Timestamp('2006-01-20', tz='UTC'),
+                    'exchange': 'TEST'
+                },
                 6: {
                     'root_symbol': 'CL',
                     'symbol': 'CLK06',
                     'start_date': pd.Timestamp('2005-12-01', tz='UTC'),
                     'notice_date': pd.Timestamp('2006-03-20', tz='UTC'),
-                    'expiration_date': pd.Timestamp('2006-04-20', tz='UTC')},
+                    'expiration_date': pd.Timestamp('2006-04-20', tz='UTC'),
+                    'exchange': 'TEST',
+                },
                 7: {
                     'symbol': 'CLQ06',
                     'root_symbol': 'CL',
                     'start_date': pd.Timestamp('2005-12-01', tz='UTC'),
                     'notice_date': pd.Timestamp('2006-06-20', tz='UTC'),
-                    'expiration_date': pd.Timestamp('2006-07-20', tz='UTC')},
+                    'expiration_date': pd.Timestamp('2006-07-20', tz='UTC'),
+                    'exchange': 'TEST',
+                },
                 8: {
                     'symbol': 'CLX06',
                     'root_symbol': 'CL',
                     'start_date': pd.Timestamp('2006-02-01', tz='UTC'),
                     'notice_date': pd.Timestamp('2006-09-20', tz='UTC'),
-                    'expiration_date': pd.Timestamp('2006-10-20', tz='UTC')}
+                    'expiration_date': pd.Timestamp('2006-10-20', tz='UTC'),
+                    'exchange': 'TEST',
+                }
             },
             orient='index',
         )
@@ -408,6 +435,86 @@ def handle_data(context, data):
                                 sim_params=self.sim_params,
                                 env=self.env)
         algo.run(self.data_portal)
+
+    def test_schedule_function_custom_cal(self):
+        # run a simulation on the CME cal, and schedule a function
+        # using the NYSE cal
+        algotext = """
+from zipline.api import (
+    schedule_function, get_datetime, time_rules, date_rules, calendars,
+)
+
+def initialize(context):
+    schedule_function(
+        func=log_nyse_open,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_open(),
+        calendar=calendars.US_EQUITIES,
+    )
+
+    schedule_function(
+        func=log_nyse_close,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_close(),
+        calendar=calendars.US_EQUITIES,
+    )
+
+    context.nyse_opens = []
+    context.nyse_closes = []
+
+def log_nyse_open(context, data):
+    context.nyse_opens.append(get_datetime())
+
+def log_nyse_close(context, data):
+    context.nyse_closes.append(get_datetime())
+        """
+
+        algo = TradingAlgorithm(
+            script=algotext,
+            sim_params=self.sim_params,
+            env=self.env,
+            trading_calendar=get_calendar("CME")
+        )
+
+        algo.run(self.data_portal)
+
+        nyse = get_calendar("NYSE")
+
+        for minute in algo.nyse_opens:
+            # each minute should be a nyse session open
+            session_label = nyse.minute_to_session_label(minute)
+            session_open = nyse.open_and_close_for_session(session_label)[0]
+            self.assertEqual(session_open, minute)
+
+        for minute in algo.nyse_closes:
+            # each minute should be a minute before a nyse session close
+            session_label = nyse.minute_to_session_label(minute)
+            session_close = nyse.open_and_close_for_session(session_label)[1]
+            self.assertEqual(session_close - timedelta(minutes=1), minute)
+
+        # Test that passing an invalid calendar parameter raises an error.
+        erroring_algotext = dedent(
+            """
+            from zipline.api import schedule_function
+            from zipline.utils.calendars import get_calendar
+
+            def initialize(context):
+                schedule_function(func=my_func, calendar=get_calendar('NYSE'))
+
+            def my_func(context, data):
+                pass
+            """
+        )
+
+        algo = TradingAlgorithm(
+            script=erroring_algotext,
+            sim_params=self.sim_params,
+            env=self.env,
+            trading_calendar=get_calendar('CME'),
+        )
+
+        with self.assertRaises(ScheduleFunctionInvalidCalendar):
+            algo.run(self.data_portal)
 
     def test_schedule_function(self):
         us_eastern = pytz.timezone('US/Eastern')
@@ -658,66 +765,6 @@ def handle_data(context, data):
         with self.assertRaises(TypeError):
             algo.future_symbol({'foo': 'bar'})
 
-    def test_future_chain(self):
-        """ Tests the future_chain API function.
-        """
-        algo = TradingAlgorithm(env=self.env)
-        algo.datetime = pd.Timestamp('2006-12-01', tz='UTC')
-
-        # Check that the fields of the FutureChain object are set correctly
-        cl = algo.future_chain('CL')
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, algo.datetime)
-
-        # Check the fields are set correctly if an as_of_date is supplied
-        as_of_date = pd.Timestamp('1952-08-11', tz='UTC')
-
-        cl = algo.future_chain('CL', as_of_date=as_of_date)
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, as_of_date)
-
-        cl = algo.future_chain('CL', as_of_date='1952-08-11')
-        self.assertEqual(cl.root_symbol, 'CL')
-        self.assertEqual(cl.as_of_date, as_of_date)
-
-        # Check that weird capitalization is corrected
-        cl = algo.future_chain('cL')
-        self.assertEqual(cl.root_symbol, 'CL')
-
-        cl = algo.future_chain('cl')
-        self.assertEqual(cl.root_symbol, 'CL')
-
-        # Check that invalid root symbols raise RootSymbolNotFound
-        with self.assertRaises(RootSymbolNotFound):
-            algo.future_chain('CLZ')
-
-        with self.assertRaises(RootSymbolNotFound):
-            algo.future_chain('')
-
-        # Check that invalid dates raise UnsupportedDatetimeFormat
-        with self.assertRaises(UnsupportedDatetimeFormat):
-            algo.future_chain('CL', 'my_finger_slipped')
-
-        with self.assertRaises(UnsupportedDatetimeFormat):
-            algo.future_chain('CL', '2015-09-')
-
-        # Supplying a non-string argument to future_chain()
-        # should result in a TypeError.
-        with self.assertRaises(TypeError):
-            algo.future_chain(1)
-
-        with self.assertRaises(TypeError):
-            algo.future_chain((1,))
-
-        with self.assertRaises(TypeError):
-            algo.future_chain({1})
-
-        with self.assertRaises(TypeError):
-            algo.future_chain([1])
-
-        with self.assertRaises(TypeError):
-            algo.future_chain({'foo': 'bar'})
-
     def test_set_symbol_lookup_date(self):
         """
         Test the set_symbol_lookup_date API method.
@@ -734,6 +781,7 @@ def handle_data(context, data):
                     'symbol': 'DUP',
                     'start_date': date.value,
                     'end_date': (date + timedelta(days=1)).value,
+                    'exchange': 'TEST',
                 }
                 for i, date in enumerate(dates)
             ]
@@ -777,10 +825,13 @@ class TestTransformAlgorithm(WithLogger,
 
     @classmethod
     def make_futures_info(cls):
-        return pd.DataFrame.from_dict(
-            {3: {'multiplier': 10, 'symbol': 'F'}},
-            orient='index',
-        )
+        return pd.DataFrame.from_dict({
+            3: {
+                'multiplier': 10,
+                'symbol': 'F',
+                'exchange': 'TEST'
+            }
+        }, orient='index')
 
     @classmethod
     def make_equity_daily_bar_data(cls):
@@ -856,10 +907,10 @@ def before_trading_start(context, data):
 
         res2 = algo2.run(self.data_portal)
 
-        # FIXME I think we are getting Nans due to fixed benchmark,
-        # so dropping them for now.
-        res1 = res1.fillna(method='ffill')
-        res2 = res2.fillna(method='ffill')
+        # There are some np.NaN values in the first row because there is not
+        # enough data to calculate the metric, e.g. beta.
+        res1 = res1.fillna(value=0)
+        res2 = res2.fillna(value=0)
 
         np.testing.assert_array_equal(res1, res2)
 
@@ -884,15 +935,37 @@ def before_trading_start(context, data):
         )
         self.assertEqual(algo.sim_params.data_frequency, 'minute')
 
+    def test_order_rounding(self):
+        answer_key = [
+            (0, 0),
+            (10, 10),
+            (1.1, 1),
+            (1.5, 1),
+            (1.9998, 1),
+            (1.99991, 2),
+        ]
+
+        for input, answer in answer_key:
+            self.assertEqual(
+                answer,
+                TradingAlgorithm.round_order(input)
+            )
+
+            self.assertEqual(
+                -1 * answer,
+                TradingAlgorithm.round_order(-1 * input)
+            )
+
     @parameterized.expand([
-        (TestOrderAlgorithm,),
-        (TestOrderValueAlgorithm,),
-        (TestTargetAlgorithm,),
-        (TestOrderPercentAlgorithm,),
-        (TestTargetPercentAlgorithm,),
-        (TestTargetValueAlgorithm,),
+        ('order', TestOrderAlgorithm,),
+        ('order_value', TestOrderValueAlgorithm,),
+        ('order_target', TestTargetAlgorithm,),
+        ('order_percent', TestOrderPercentAlgorithm,),
+        ('order_target_percent', TestTargetPercentAlgorithm,),
+        ('order_target_value', TestTargetValueAlgorithm,),
+        ('batch_order_target_percent', TestBatchTargetPercentAlgorithm,),
     ])
-    def test_order_methods(self, algo_class):
+    def test_order_methods(self, test_name, algo_class):
         algo = algo_class(
             sim_params=self.sim_params,
             env=self.env,
@@ -915,7 +988,7 @@ def before_trading_start(context, data):
             sim_params=self.sim_params,
             env=self.env,
         )
-        # Ensure that the environment's asset 0 is a Future
+        # Ensure that the environment's asset 3 is a Future
         asset_to_test = algo.sid(3)
         self.assertIsInstance(asset_to_test, Future)
 
@@ -986,7 +1059,8 @@ def before_trading_start(context, data):
         period_end = pd.Timestamp('2002-1-4', tz='UTC')
         equities = pd.DataFrame([{
             'start_date': start_session,
-            'end_date': period_end + timedelta(days=1)
+            'end_date': period_end + timedelta(days=1),
+            'exchange': "TEST",
         }] * 2)
         equities['symbol'] = ['A', 'B']
         with TempDirectory() as tempdir, \
@@ -994,7 +1068,7 @@ def before_trading_start(context, data):
             sim_params = SimulationParameters(
                 start_session=start_session,
                 end_session=period_end,
-                capital_base=float("1.0e5"),
+                capital_base=1.0e5,
                 data_frequency='minute',
                 trading_calendar=self.trading_calendar,
             )
@@ -1058,6 +1132,7 @@ class TestBeforeTradingStart(WithDataPortal,
 
     DATA_PORTAL_FIRST_TRADING_DAY = pd.Timestamp("2016-01-05", tz='UTC')
     EQUITY_MINUTE_BAR_START_DATE = pd.Timestamp("2016-01-05", tz='UTC')
+    FUTURE_MINUTE_BAR_START_DATE = pd.Timestamp("2016-01-05", tz='UTC')
 
     data_start = ASSET_FINDER_EQUITY_START_DATE = pd.Timestamp(
         '2016-01-05',
@@ -1332,9 +1407,10 @@ class TestBeforeTradingStart(WithDataPortal,
                     assert (context.hd_portfolio.__dict__[k]
                             == bts_portfolio.__dict__[k])
             record(pos_value=bts_portfolio.positions_value)
-            record(pos_amount=bts_portfolio.positions[sid(3)]['amount'])
-            record(last_sale_price=bts_portfolio.positions[sid(3)]
-                   ['last_sale_price'])
+            record(pos_amount=bts_portfolio.positions[sid(3)].amount)
+            record(
+                last_sale_price=bts_portfolio.positions[sid(3)].last_sale_price
+            )
         def handle_data(context, data):
             if not context.ordered:
                 order(sid(3), 1)
@@ -1406,35 +1482,62 @@ class TestAlgoScript(WithLogger,
     DATA_PORTAL_USE_MINUTE_DATA = False
     EQUITY_DAILY_BAR_LOOKBACK_DAYS = 5  # max history window length
 
+    STRING_TYPE_NAMES = [s.__name__ for s in string_types]
+    STRING_TYPE_NAMES_STRING = ', '.join(STRING_TYPE_NAMES)
+    ASSET_TYPE_NAME = Asset.__name__
+    CONTINUOUS_FUTURE_NAME = ContinuousFuture.__name__
+    ASSET_OR_STRING_TYPE_NAMES = ', '.join([ASSET_TYPE_NAME] +
+                                           STRING_TYPE_NAMES)
+    ASSET_OR_STRING_OR_CF_TYPE_NAMES = ', '.join([ASSET_TYPE_NAME,
+                                                  CONTINUOUS_FUTURE_NAME] +
+                                                 STRING_TYPE_NAMES)
     ARG_TYPE_TEST_CASES = (
-        ('history__assets', (bad_type_history_assets, 'Asset, str', True)),
-        ('history__fields', (bad_type_history_fields, 'str', True)),
+        ('history__assets', (bad_type_history_assets,
+                             ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+                             True)),
+        ('history__fields', (bad_type_history_fields,
+                             STRING_TYPE_NAMES_STRING,
+                             True)),
         ('history__bar_count', (bad_type_history_bar_count, 'int', False)),
-        ('history__frequency', (bad_type_history_frequency, 'str', False)),
-        ('current__assets', (bad_type_current_assets, 'Asset, str', True)),
-        ('current__fields', (bad_type_current_fields, 'str', True)),
+        ('history__frequency', (bad_type_history_frequency,
+                                STRING_TYPE_NAMES_STRING,
+                                False)),
+        ('current__assets', (bad_type_current_assets,
+                             ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+                             True)),
+        ('current__fields', (bad_type_current_fields,
+                             STRING_TYPE_NAMES_STRING,
+                             True)),
         ('is_stale__assets', (bad_type_is_stale_assets, 'Asset', True)),
         ('can_trade__assets', (bad_type_can_trade_assets, 'Asset', True)),
         ('history_kwarg__assets',
-         (bad_type_history_assets_kwarg, 'Asset, str', True)),
+         (bad_type_history_assets_kwarg,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('history_kwarg_bad_list__assets',
-         (bad_type_history_assets_kwarg_list, 'Asset, str', True)),
+         (bad_type_history_assets_kwarg_list,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('history_kwarg__fields',
-         (bad_type_history_fields_kwarg, 'str', True)),
+         (bad_type_history_fields_kwarg, STRING_TYPE_NAMES_STRING, True)),
         ('history_kwarg__bar_count',
          (bad_type_history_bar_count_kwarg, 'int', False)),
         ('history_kwarg__frequency',
-         (bad_type_history_frequency_kwarg, 'str', False)),
+         (bad_type_history_frequency_kwarg, STRING_TYPE_NAMES_STRING, False)),
         ('current_kwarg__assets',
-         (bad_type_current_assets_kwarg, 'Asset, str', True)),
+         (bad_type_current_assets_kwarg,
+          ASSET_OR_STRING_OR_CF_TYPE_NAMES,
+          True)),
         ('current_kwarg__fields',
-         (bad_type_current_fields_kwarg, 'str', True)),
+         (bad_type_current_fields_kwarg, STRING_TYPE_NAMES_STRING, True)),
     )
 
     sids = 0, 1, 3, 133
 
     @classmethod
     def make_equity_info(cls):
+        register_calendar("TEST", get_calendar("NYSE"), force=True)
+
         data = make_simple_equity_info(
             cls.sids,
             cls.START_DATE,
@@ -1636,6 +1739,27 @@ def handle_data(context, data):
         finally:
             tempdir.cleanup()
 
+    def test_incorrectly_set_futures_slippage_model(self):
+        code = dedent(
+            """
+            from zipline.api import set_slippage, slippage
+
+            class MySlippage(slippage.FutureSlippageModel):
+                def process_order(self, data, order):
+                    return data.current(order.asset, 'price'), order.amount
+
+            def initialize(context):
+                set_slippage(MySlippage())
+            """
+        )
+        test_algo = TradingAlgorithm(
+            script=code, sim_params=self.sim_params, env=self.env,
+        )
+        with self.assertRaises(IncompatibleSlippageModel):
+            # Passing a futures slippage model as the first argument, which is
+            # for setting equity models, should fail.
+            test_algo.run(self.data_portal)
+
     def test_algo_record_vars(self):
         test_algo = TradingAlgorithm(
             script=record_variables,
@@ -1684,6 +1808,112 @@ def handle_data(context, data):
             env=self.env,
         )
         test_algo.run(self.data_portal)
+
+    def test_batch_order_target_percent_matches_multi_order(self):
+        weights = pd.Series([.3, .7])
+
+        multi_blotter = RecordBatchBlotter(self.SIM_PARAMS_DATA_FREQUENCY)
+        multi_test_algo = TradingAlgorithm(
+            script=dedent("""\
+                from collections import OrderedDict
+                from six import iteritems
+
+                from zipline.api import sid, order_target_percent
+
+
+                def initialize(context):
+                    context.assets = [sid(0), sid(3)]
+                    context.placed = False
+
+                def handle_data(context, data):
+                    if not context.placed:
+                        for asset, weight in iteritems(OrderedDict(zip(
+                            context.assets, {weights}
+                        ))):
+                            order_target_percent(asset, weight)
+
+                        context.placed = True
+
+            """).format(weights=list(weights)),
+            blotter=multi_blotter,
+            env=self.env,
+        )
+        multi_stats = multi_test_algo.run(self.data_portal)
+        self.assertFalse(multi_blotter.order_batch_called)
+
+        batch_blotter = RecordBatchBlotter(self.SIM_PARAMS_DATA_FREQUENCY)
+        batch_test_algo = TradingAlgorithm(
+            script=dedent("""\
+                from collections import OrderedDict
+
+                from zipline.api import sid, batch_order_target_percent
+
+
+                def initialize(context):
+                    context.assets = [sid(0), sid(3)]
+                    context.placed = False
+
+                def handle_data(context, data):
+                    if not context.placed:
+                        orders = batch_order_target_percent(OrderedDict(zip(
+                            context.assets, {weights}
+                        )))
+                        assert len(orders) == 2, \
+                            "len(orders) was %s but expected 2" % len(orders)
+                        for o in orders:
+                            assert o is not None, "An order is None"
+
+                        context.placed = True
+
+            """).format(weights=list(weights)),
+            blotter=batch_blotter,
+            env=self.env,
+        )
+        batch_stats = batch_test_algo.run(self.data_portal)
+        self.assertTrue(batch_blotter.order_batch_called)
+
+        for stats in (multi_stats, batch_stats):
+            stats.orders = stats.orders.apply(
+                lambda orders: [toolz.dissoc(o, 'id') for o in orders]
+            )
+            stats.transactions = stats.transactions.apply(
+                lambda txns: [toolz.dissoc(txn, 'order_id') for txn in txns]
+            )
+        assert_equal(multi_stats, batch_stats)
+
+    def test_batch_order_target_percent_filters_null_orders(self):
+        weights = pd.Series([1, 0])
+
+        batch_blotter = RecordBatchBlotter(self.SIM_PARAMS_DATA_FREQUENCY)
+        batch_test_algo = TradingAlgorithm(
+            script=dedent("""\
+                from collections import OrderedDict
+
+                from zipline.api import sid, batch_order_target_percent
+
+
+                def initialize(context):
+                    context.assets = [sid(0), sid(3)]
+                    context.placed = False
+
+                def handle_data(context, data):
+                    if not context.placed:
+                        orders = batch_order_target_percent(OrderedDict(zip(
+                            context.assets, {weights}
+                        )))
+                        assert len(orders) == 1, \
+                            "len(orders) was %s but expected 1" % len(orders)
+                        for o in orders:
+                            assert o is not None, "An order is None"
+
+                        context.placed = True
+
+            """).format(weights=list(weights)),
+            blotter=batch_blotter,
+            env=self.env,
+        )
+        batch_test_algo.run(self.data_portal)
+        self.assertTrue(batch_blotter.order_batch_called)
 
     def test_order_dead_asset(self):
         # after asset 0 is dead
@@ -1769,6 +1999,7 @@ def handle_data(context, data):
         Test that api methods on the data object can be called with positional
         arguments.
         """
+
         params = SimulationParameters(
             start_session=pd.Timestamp("2006-01-10", tz='UTC'),
             end_session=pd.Timestamp("2006-01-11", tz='UTC'),
@@ -1957,6 +2188,8 @@ def handle_data(context, data):
         """)
 
         with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("ignore", PerformanceWarning)
+
             algo = TradingAlgorithm(
                 script=algocode,
                 sim_params=sim_params,
@@ -1964,18 +2197,19 @@ def handle_data(context, data):
             )
             algo.run(self.data_portal)
 
-        self.assertEqual(len(w), 2)
-        for i, warning in enumerate(w):
-            self.assertIsInstance(warning.message, UserWarning)
-            self.assertEqual(
-                warning.message.args[0],
-                'Got a time rule for the second positional argument '
-                'date_rule. You should use keyword argument '
-                'time_rule= when calling schedule_function without '
-                'specifying a date_rule'
-            )
-            # The warnings come from line 13 and 14 in the algocode
-            self.assertEqual(warning.lineno, 13 + i)
+            self.assertEqual(len(w), 2)
+
+            for i, warning in enumerate(w):
+                self.assertIsInstance(warning.message, UserWarning)
+                self.assertEqual(
+                    warning.message.args[0],
+                    'Got a time rule for the second positional argument '
+                    'date_rule. You should use keyword argument '
+                    'time_rule= when calling schedule_function without '
+                    'specifying a date_rule'
+                )
+                # The warnings come from line 13 and 14 in the algocode
+                self.assertEqual(warning.lineno, 13 + i)
 
         self.assertEqual(
             algo.done_at_open,
@@ -2027,7 +2261,7 @@ class TestCapitalChanges(WithLogger,
 
     @classmethod
     def make_equity_daily_bar_data(cls):
-        days = cls.trading_calendar.minutes_in_range(
+        days = cls.trading_calendar.sessions_in_range(
             pd.Timestamp('2006-01-03', tz='UTC'),
             pd.Timestamp('2006-01-09', tz='UTC')
         )
@@ -2085,6 +2319,16 @@ def order_stuff(context, data):
         cumulative_perf = \
             [r['cumulative_perf'] for r in results if 'cumulative_perf' in r]
         daily_perf = [r['daily_perf'] for r in results if 'daily_perf' in r]
+        capital_change_packets = \
+            [r['capital_change'] for r in results if 'capital_change' in r]
+
+        self.assertEqual(len(capital_change_packets), 1)
+        self.assertEqual(
+            capital_change_packets[0],
+            {'date': pd.Timestamp('2006-01-06', tz='UTC'),
+             'type': 'cash',
+             'target': 153000.0 if change_type == 'target' else None,
+             'delta': 50000.0})
 
         # 1/03: price = 10, place orders
         # 1/04: orders execute at price = 11, place orders
@@ -2235,6 +2479,17 @@ def order_stuff(context, data):
         cumulative_perf = \
             [r['cumulative_perf'] for r in results if 'cumulative_perf' in r]
         daily_perf = [r['daily_perf'] for r in results if 'daily_perf' in r]
+        capital_change_packets = \
+            [r['capital_change'] for r in results if 'capital_change' in r]
+
+        self.assertEqual(len(capital_change_packets), len(capital_changes))
+        expected = [
+            {'date': pd.Timestamp(val[0], tz='UTC'),
+             'type': 'cash',
+             'target': val[1] if change_type == 'target' else None,
+             'delta': 1000.0 if len(values) == 1 else 500.0}
+            for val in values]
+        self.assertEqual(capital_change_packets, expected)
 
         # 1/03: place orders at price = 100, execute at 101
         # 1/04: place orders at price = 490, execute at 491,
@@ -2392,6 +2647,17 @@ def order_stuff(context, data):
             [r['cumulative_perf'] for r in results if 'cumulative_perf' in r]
         minute_perf = [r['minute_perf'] for r in results if 'minute_perf' in r]
         daily_perf = [r['daily_perf'] for r in results if 'daily_perf' in r]
+        capital_change_packets = \
+            [r['capital_change'] for r in results if 'capital_change' in r]
+
+        self.assertEqual(len(capital_change_packets), len(capital_changes))
+        expected = [
+            {'date': pd.Timestamp(val[0], tz='UTC'),
+             'type': 'cash',
+             'target': val[1] if change_type == 'target' else None,
+             'delta': 1000.0 if len(values) == 1 else 500.0}
+            for val in values]
+        self.assertEqual(capital_change_packets, expected)
 
         # 1/03: place orders at price = 100, execute at 101
         # 1/04: place orders at price = 490, execute at 491,
@@ -2719,34 +2985,114 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                                            env=self.env)
         self.check_algo_fails(algo, handle_data, 0)
 
-    def test_set_do_not_order_list(self):
-        # set the restricted list to be the sid, and fail.
-        algo = SetDoNotOrderListAlgorithm(
-            sid=self.sid,
-            restricted_list=[self.sid],
-            sim_params=self.sim_params,
-            env=self.env,
-        )
+    def test_set_asset_restrictions(self):
 
         def handle_data(algo, data):
+            algo.could_trade = data.can_trade(algo.sid(self.sid))
             algo.order(algo.sid(self.sid), 100)
             algo.order_count += 1
 
+        # Set HistoricalRestrictions for one sid for the entire simulation,
+        # and fail.
+        rlm = HistoricalRestrictions([
+            Restriction(
+                self.sid,
+                self.sim_params.start_session,
+                RESTRICTION_STATES.FROZEN)
+        ])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
         self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
+
+        # Set StaticRestrictions for one sid and fail.
+        rlm = StaticRestrictions([self.sid])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
+
+        # just log an error on the violation if we choose not to fail.
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+            on_error='log'
+        )
+        with make_test_handler(self) as log_catcher:
+            self.check_algo_succeeds(algo, handle_data)
+        logs = [r.message for r in log_catcher.records]
+        self.assertIn("Order for 100 shares of Equity(133 [A]) at "
+                      "2006-01-03 21:00:00+00:00 violates trading constraint "
+                      "RestrictedListOrder({})", logs)
+        self.assertFalse(algo.could_trade)
 
         # set the restricted list to exclude the sid, and succeed
+        rlm = HistoricalRestrictions([
+            Restriction(
+                sid,
+                self.sim_params.start_session,
+                RESTRICTION_STATES.FROZEN) for sid in [134, 135, 136]
+        ])
+        algo = SetAssetRestrictionsAlgorithm(
+            sid=self.sid,
+            restrictions=rlm,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_succeeds(algo, handle_data)
+        self.assertTrue(algo.could_trade)
+
+    @parameterized.expand([
+        ('order_first_restricted_sid', 0),
+        ('order_second_restricted_sid', 1)
+    ])
+    def test_set_multiple_asset_restrictions(self, name, to_order_idx):
+
+        def handle_data(algo, data):
+            algo.could_trade1 = data.can_trade(algo.sid(self.sids[0]))
+            algo.could_trade2 = data.can_trade(algo.sid(self.sids[1]))
+            algo.order(algo.sid(self.sids[to_order_idx]), 100)
+            algo.order_count += 1
+
+        rl1 = StaticRestrictions([self.sids[0]])
+        rl2 = StaticRestrictions([self.sids[1]])
+        algo = SetMultipleAssetRestrictionsAlgorithm(
+            restrictions1=rl1,
+            restrictions2=rl2,
+            sim_params=self.sim_params,
+            env=self.env,
+        )
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade1)
+        self.assertFalse(algo.could_trade2)
+
+    def test_set_do_not_order_list(self):
+
+        def handle_data(algo, data):
+            algo.could_trade = data.can_trade(algo.sid(self.sid))
+            algo.order(algo.sid(self.sid), 100)
+            algo.order_count += 1
+
+        rlm = [self.sid]
         algo = SetDoNotOrderListAlgorithm(
             sid=self.sid,
-            restricted_list=[134, 135, 136],
+            restricted_list=rlm,
             sim_params=self.sim_params,
             env=self.env,
         )
 
-        def handle_data(algo, data):
-            algo.order(algo.sid(self.sid), 100)
-            algo.order_count += 1
-
-        self.check_algo_succeeds(algo, handle_data)
+        self.check_algo_fails(algo, handle_data, 0)
+        self.assertFalse(algo.could_trade)
 
     def test_set_max_order_size(self):
 
@@ -2819,7 +3165,8 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                 1: {
                     'symbol': 'SYM',
                     'start_date': start,
-                    'end_date': start + timedelta(days=6)
+                    'end_date': start + timedelta(days=6),
+                    'exchange': "TEST",
                 },
             },
             orient='index',
@@ -2948,6 +3295,8 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
             'symbol': 'SYM',
             'start_date': self.sim_params.start_session,
             'end_date': '2020-01-01',
+            'exchange': "TEST",
+            'sid': 999,
         }])
         with TempDirectory() as tempdir, \
                 tmp_trading_env(equities=metadata) as env:
@@ -2959,7 +3308,7 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                 env.asset_finder,
                 tempdir,
                 self.sim_params,
-                [0],
+                [999],
                 self.trading_calendar,
             )
             algo.run(data_portal)
@@ -2968,6 +3317,8 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
             'symbol': 'SYM',
             'start_date': '1989-01-01',
             'end_date': '1990-01-01',
+            'exchange': "TEST",
+            'sid': 999,
         }])
         with TempDirectory() as tempdir, \
                 tmp_trading_env(equities=metadata) as env:
@@ -2975,7 +3326,7 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                 env.asset_finder,
                 tempdir,
                 self.sim_params,
-                [0],
+                [999],
                 self.trading_calendar,
             )
             algo = SetAssetDateBoundsAlgorithm(
@@ -2989,6 +3340,8 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
             'symbol': 'SYM',
             'start_date': '2020-01-01',
             'end_date': '2021-01-01',
+            'exchange': "TEST",
+            'sid': 999,
         }])
         with TempDirectory() as tempdir, \
                 tmp_trading_env(equities=metadata) as env:
@@ -2996,7 +3349,7 @@ class TestTradingControls(WithSimParams, WithDataPortal, ZiplineTestCase):
                 env.asset_finder,
                 tempdir,
                 self.sim_params,
-                [0],
+                [999],
                 self.trading_calendar,
             )
             algo = SetAssetDateBoundsAlgorithm(
@@ -3216,6 +3569,208 @@ class TestFutureFlip(WithDataPortal, WithSimParams, ZiplineTestCase):
                 format(i, actual_position, expected_positions[i]))
 
 
+class TestFuturesAlgo(WithDataPortal, WithSimParams, ZiplineTestCase):
+    START_DATE = pd.Timestamp('2016-01-06', tz='utc')
+    END_DATE = pd.Timestamp('2016-01-07', tz='utc')
+    FUTURE_MINUTE_BAR_START_DATE = pd.Timestamp('2016-01-05', tz='UTC')
+
+    SIM_PARAMS_DATA_FREQUENCY = 'minute'
+
+    TRADING_CALENDAR_STRS = ('us_futures',)
+    TRADING_CALENDAR_PRIMARY_CAL = 'us_futures'
+
+    @classmethod
+    def make_futures_info(cls):
+        return pd.DataFrame.from_dict(
+            {
+                1: {
+                    'symbol': 'CLG16',
+                    'root_symbol': 'CL',
+                    'start_date': pd.Timestamp('2015-12-01', tz='UTC'),
+                    'notice_date': pd.Timestamp('2016-01-20', tz='UTC'),
+                    'expiration_date': pd.Timestamp('2016-02-19', tz='UTC'),
+                    'auto_close_date': pd.Timestamp('2016-01-18', tz='UTC'),
+                    'exchange': 'TEST',
+                },
+            },
+            orient='index',
+        )
+
+    def test_futures_history(self):
+        algo_code = dedent(
+            """
+            from datetime import time
+            from zipline.api import (
+                date_rules,
+                get_datetime,
+                schedule_function,
+                sid,
+                time_rules,
+            )
+
+            def initialize(context):
+                context.history_values = []
+
+                schedule_function(
+                    make_history_call,
+                    date_rules.every_day(),
+                    time_rules.market_open(),
+                )
+
+                schedule_function(
+                    check_market_close_time,
+                    date_rules.every_day(),
+                    time_rules.market_close(),
+                )
+
+            def make_history_call(context, data):
+                # Ensure that the market open is 6:31am US/Eastern.
+                open_time = get_datetime().tz_convert('US/Eastern').time()
+                assert open_time == time(6, 31)
+                context.history_values.append(
+                    data.history(sid(1), 'close', 5, '1m'),
+                )
+
+            def check_market_close_time(context, data):
+                # Ensure that this function is called at 4:59pm US/Eastern.
+                # By default, `market_close()` uses an offset of 1 minute.
+                close_time = get_datetime().tz_convert('US/Eastern').time()
+                assert close_time == time(16, 59)
+            """
+        )
+
+        algo = TradingAlgorithm(
+            script=algo_code,
+            sim_params=self.sim_params,
+            env=self.env,
+            trading_calendar=get_calendar('us_futures'),
+        )
+        algo.run(self.data_portal)
+
+        # Assert that we were able to retrieve history data for minutes outside
+        # of the 6:31am US/Eastern to 5:00pm US/Eastern futures open times.
+        np.testing.assert_array_equal(
+            algo.history_values[0].index,
+            pd.date_range(
+                '2016-01-06 6:27',
+                '2016-01-06 6:31',
+                freq='min',
+                tz='US/Eastern',
+            ),
+        )
+        np.testing.assert_array_equal(
+            algo.history_values[1].index,
+            pd.date_range(
+                '2016-01-07 6:27',
+                '2016-01-07 6:31',
+                freq='min',
+                tz='US/Eastern',
+            ),
+        )
+
+        # Expected prices here are given by the range values created by the
+        # default `make_future_minute_bar_data` method.
+        np.testing.assert_array_equal(
+            algo.history_values[0].values, list(map(float, range(2196, 2201))),
+        )
+        np.testing.assert_array_equal(
+            algo.history_values[1].values, list(map(float, range(3636, 3641))),
+        )
+
+    @staticmethod
+    def algo_with_slippage(slippage_model):
+        return dedent(
+            """
+            from zipline.api import (
+                commission,
+                order,
+                set_commission,
+                set_slippage,
+                sid,
+                slippage,
+                get_datetime,
+            )
+
+            def initialize(context):
+                commission_model = commission.PerFutureTrade(0)
+                set_commission(us_futures=commission_model)
+                slippage_model = slippage.{model}
+                set_slippage(us_futures=slippage_model)
+                context.ordered = False
+
+            def handle_data(context, data):
+                if not context.ordered:
+                    order(sid(1), 10)
+                    context.ordered = True
+                    context.order_price = data.current(sid(1), 'price')
+            """
+        ).format(model=slippage_model)
+
+    def test_fixed_future_slippage(self):
+        algo_code = self.algo_with_slippage('FixedSlippage(spread=0.10)')
+        algo = TradingAlgorithm(
+            script=algo_code,
+            sim_params=self.sim_params,
+            env=self.env,
+            trading_calendar=get_calendar('us_futures'),
+        )
+        results = algo.run(self.data_portal)
+
+        # Flatten the list of transactions.
+        all_txns = [
+            val for sublist in results['transactions'].tolist()
+            for val in sublist
+        ]
+
+        self.assertEqual(len(all_txns), 1)
+        txn = all_txns[0]
+
+        # Add 1 to the expected price because the order does not fill until the
+        # bar after the price is recorded.
+        expected_spread = 0.05
+        expected_price = (algo.order_price + 1) + expected_spread
+
+        # Capital used should be 0 because there is no commission, and the cost
+        # to enter into a long position on a futures contract is 0.
+        self.assertEqual(txn['price'], expected_price)
+        self.assertEqual(results['orders'][0][0]['commission'], 0.0)
+        self.assertEqual(results.capital_used[0], 0.0)
+
+    def test_volume_contract_slippage(self):
+        algo_code = self.algo_with_slippage(
+            'VolumeShareSlippage(volume_limit=0.05, price_impact=0.1)',
+        )
+        algo = TradingAlgorithm(
+            script=algo_code,
+            sim_params=self.sim_params,
+            env=self.env,
+            trading_calendar=get_calendar('us_futures'),
+        )
+        results = algo.run(self.data_portal)
+
+        # There should be no commissions.
+        self.assertEqual(results['orders'][0][0]['commission'], 0.0)
+
+        # Flatten the list of transactions.
+        all_txns = [
+            val for sublist in results['transactions'].tolist()
+            for val in sublist
+        ]
+
+        # With a volume limit of 0.05, and a total volume of 100 contracts
+        # traded per minute, we should require 2 transactions to order 10
+        # contracts.
+        self.assertEqual(len(all_txns), 2)
+
+        for i, txn in enumerate(all_txns):
+            # Add 1 to the order price because the order does not fill until
+            # the bar after the price is recorded.
+            order_price = algo.order_price + i + 1
+            expected_impact = order_price * 0.1 * (0.05 ** 2)
+            expected_price = order_price + expected_impact
+            self.assertEqual(txn['price'], expected_price)
+
+
 class TestTradingAlgorithm(ZiplineTestCase):
     def test_analyze_called(self):
         self.perf_ref = None
@@ -3297,7 +3852,7 @@ class TestOrderCancelation(WithDataPortal,
                 'high': minutes_arr + 2,
                 'low': minutes_arr - 1,
                 'close': minutes_arr,
-                'volume': np.full(minutes_count, 1),
+                'volume': np.full(minutes_count, 1.0),
             },
             index=asset_minutes,
         )
@@ -3306,11 +3861,11 @@ class TestOrderCancelation(WithDataPortal,
     def make_equity_daily_bar_data(cls):
         yield 1, pd.DataFrame(
             {
-                'open': np.full(3, 1),
-                'high': np.full(3, 1),
-                'low': np.full(3, 1),
-                'close': np.full(3, 1),
-                'volume': np.full(3, 1),
+                'open': np.full(3, 1, dtype=np.float64),
+                'high': np.full(3, 1, dtype=np.float64),
+                'low': np.full(3, 1, dtype=np.float64),
+                'close': np.full(3, 1, dtype=np.float64),
+                'volume': np.full(3, 1, dtype=np.float64),
             },
             index=cls.sim_params.sessions,
         )
@@ -3359,7 +3914,7 @@ class TestOrderCancelation(WithDataPortal,
                     np.copysign(389, direction),
                     daily_positions[0]["amount"],
                 )
-                self.assertEqual(1, results.positions[0][0]["sid"].sid)
+                self.assertEqual(1, results.positions[0][0]["sid"])
 
             # should be an order on day1, but no more orders afterwards
             np.testing.assert_array_equal([1, 0, 0],
@@ -3437,7 +3992,7 @@ class TestOrderCancelation(WithDataPortal,
             self.assertFalse(log_catcher.has_warnings)
 
 
-class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
+class TestEquityAutoClose(WithTmpDir, WithTradingCalendars, ZiplineTestCase):
     """
     Tests if delisted equities are properly removed from a portfolio holding
     positions in said equities.
@@ -3455,7 +4010,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         cls.first_asset_expiration = cls.test_days[2]
 
     def make_data(self, auto_close_delta, frequency,
-                  capital_base=float("1.0e5")):
+                  capital_base=1.0e5):
 
         asset_info = make_jagged_equity_info(
             num_assets=3,
@@ -3469,12 +4024,6 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         sids = asset_info.index
 
         env = self.enter_instance_context(tmp_trading_env(equities=asset_info))
-        market_opens = self.trading_calendar.schedule.market_open.loc[
-            self.test_days
-        ]
-        market_closes = self.trading_calendar.schedule.market_close.loc[
-            self.test_days
-        ]
 
         if frequency == 'daily':
             dates = self.test_days
@@ -3506,10 +4055,10 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 self.test_days[-1],
             )
             writer = BcolzMinuteBarWriter(
-                self.test_days[0],
                 self.tmpdir.path,
-                market_opens,
-                market_closes,
+                self.trading_calendar,
+                self.test_days[0],
+                self.test_days[-1],
                 US_EQUITIES_MINUTES_PER_DAY
             )
             trade_data_by_sid = make_trade_data_for_asset_info(
@@ -3630,7 +4179,6 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         resources = self.make_data(auto_close_delta, 'daily', capital_base)
 
         assets = resources.assets
-        sids = [asset.sid for asset in assets]
         final_prices = resources.final_prices
 
         # Prices at which we expect our orders to be filled.
@@ -3731,14 +4279,20 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         transactions = output['transactions']
         initial_fills = transactions.iloc[1]
         self.assertEqual(len(initial_fills), len(assets))
-        for sid, txn in zip(sids, initial_fills):
+
+        last_minute_of_session = \
+            self.trading_calendar.open_and_close_for_session(
+                self.test_days[1]
+            )[1]
+
+        for asset, txn in zip(assets, initial_fills):
             self.assertDictContainsSubset(
                 {
                     'amount': order_size,
                     'commission': None,
-                    'dt': self.test_days[1],
-                    'price': initial_fill_prices[sid],
-                    'sid': sid,
+                    'dt': last_minute_of_session,
+                    'price': initial_fill_prices[asset],
+                    'sid': asset,
                 },
                 txn,
             )
@@ -3760,7 +4314,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 'commission': 0.0,
                 'dt': assets[0].auto_close_date,
                 'price': fp0,
-                'sid': sids[0],
+                'sid': assets[0],
                 'order_id': None,  # Auto-close txns emit Nones for order_id.
             },
         )
@@ -3775,7 +4329,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 'commission': 0.0,
                 'dt': assets[1].auto_close_date,
                 'price': fp1,
-                'sid': sids[1],
+                'sid': assets[1],
                 'order_id': None,  # Auto-close txns emit Nones for order_id.
             },
         )
@@ -3803,15 +4357,17 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 context.portfolio.cash == context.portfolio.starting_cash
             )
 
-            now = context.get_datetime()
+            today_session = self.trading_calendar.minute_to_session_label(
+                context.get_datetime()
+            )
 
-            if now == first_asset_end_date:
+            if today_session == first_asset_end_date:
                 # Equity 0 will no longer exist tomorrow, so this order will
                 # never be filled.
                 assert len(context.get_open_orders()) == 0
                 context.order(context.sid(0), 10)
                 assert len(context.get_open_orders()) == 1
-            elif now == first_asset_auto_close_date:
+            elif today_session == first_asset_auto_close_date:
                 assert len(context.get_open_orders()) == 0
 
         algo = TradingAlgorithm(
@@ -3829,12 +4385,18 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
 
         original_open_orders = orders_for_date(first_asset_end_date)
         assert len(original_open_orders) == 1
+
+        last_close_for_asset = \
+            algo.trading_calendar.open_and_close_for_session(
+                first_asset_end_date
+            )[1]
+
         self.assertDictContainsSubset(
             {
                 'amount': 10,
                 'commission': 0,
-                'created': first_asset_end_date,
-                'dt': first_asset_end_date,
+                'created': last_close_for_asset,
+                'dt': last_close_for_asset,
                 'sid': assets[0],
                 'status': ORDER_STATUS.OPEN,
                 'filled': 0,
@@ -3848,7 +4410,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
             {
                 'amount': 10,
                 'commission': 0,
-                'created': first_asset_end_date,
+                'created': last_close_for_asset,
                 'dt': first_asset_auto_close_date,
                 'sid': assets[0],
                 'status': ORDER_STATUS.CANCELLED,
@@ -3862,7 +4424,6 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
 
         env = resources.env
         assets = resources.assets
-        sids = [a.sid for a in assets]
         final_prices = resources.final_prices
         backtest_minutes = resources.trade_data_by_sid[0].index.tolist()
 
@@ -3875,7 +4436,6 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
             env=env,
             sim_params=resources.sim_params,
             data_frequency='minute',
-            capital_base=capital_base,
         )
 
         output = algo.run(resources.data_portal)
@@ -3940,14 +4500,14 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         # the backtest, which is still on the first day in minute mode.
         initial_fills = transactions.iloc[0]
         self.assertEqual(len(initial_fills), len(assets))
-        for sid, txn in zip(sids, initial_fills):
+        for asset, txn in zip(assets, initial_fills):
             self.assertDictContainsSubset(
                 {
                     'amount': order_size,
                     'commission': None,
                     'dt': backtest_minutes[1],
-                    'price': initial_fill_prices[sid],
-                    'sid': sid,
+                    'price': initial_fill_prices[asset],
+                    'sid': asset,
                 },
                 txn,
             )
@@ -3969,7 +4529,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 'commission': 0.0,
                 'dt': assets[0].auto_close_date,
                 'price': fp0,
-                'sid': sids[0],
+                'sid': assets[0],
                 'order_id': None,  # Auto-close txns emit Nones for order_id.
             },
         )
@@ -3984,7 +4544,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 'commission': 0.0,
                 'dt': assets[1].auto_close_date,
                 'price': fp1,
-                'sid': sids[1],
+                'sid': assets[1],
                 'order_id': None,  # Auto-close txns emit Nones for order_id.
             },
         )
@@ -4000,11 +4560,21 @@ class TestOrderAfterDelist(WithTradingEnvironment, ZiplineTestCase):
     def make_equity_info(cls):
         return pd.DataFrame.from_dict(
             {
+                # Asset whose auto close date is after its end date.
                 1: {
                     'start_date': cls.start,
                     'end_date': cls.day_1,
                     'auto_close_date': cls.day_4,
-                    'symbol': "ASSET1"
+                    'symbol': "ASSET1",
+                    'exchange': "TEST",
+                },
+                # Asset whose auto close date is before its end date.
+                2: {
+                    'start_date': cls.start,
+                    'end_date': cls.day_4,
+                    'auto_close_date': cls.day_1,
+                    'symbol': 'ASSET2',
+                    'exchange': 'TEST',
                 },
             },
             orient='index',
@@ -4015,7 +4585,13 @@ class TestOrderAfterDelist(WithTradingEnvironment, ZiplineTestCase):
         super(TestOrderAfterDelist, cls).init_class_fixtures()
         cls.data_portal = FakeDataPortal(cls.env)
 
-    def test_order_in_quiet_period(self):
+    @parameterized.expand([
+        ('auto_close_after_end_date', 1),
+        ('auto_close_before_end_date', 2),
+    ])
+    def test_order_in_quiet_period(self, name, sid):
+        asset = self.asset_finder.retrieve_asset(sid)
+
         algo_code = dedent("""
         from zipline.api import (
             sid,
@@ -4031,13 +4607,13 @@ class TestOrderAfterDelist(WithTradingEnvironment, ZiplineTestCase):
             pass
 
         def handle_data(context, data):
-            order(sid(1), 1)
-            order_value(sid(1), 100)
-            order_percent(sid(1), 0.5)
-            order_target(sid(1), 50)
-            order_target_percent(sid(1), 0.5)
-            order_target_value(sid(1), 50)
-        """)
+            order(sid({sid}), 1)
+            order_value(sid({sid}), 100)
+            order_percent(sid({sid}), 0.5)
+            order_target(sid({sid}), 50)
+            order_target_percent(sid({sid}), 0.5)
+            order_target_value(sid({sid}), 50)
+        """).format(sid=sid)
 
         # run algo from 1/6 to 1/7
         algo = TradingAlgorithm(
@@ -4061,11 +4637,12 @@ class TestOrderAfterDelist(WithTradingEnvironment, ZiplineTestCase):
             self.assertEqual(6 * 390, len(warnings))
 
             for w in warnings:
-                self.assertEqual("Cannot place order for ASSET1, as it has "
-                                 "de-listed. Any existing positions for this "
-                                 "asset will be liquidated on "
-                                 "2016-01-11 00:00:00+00:00.",
-                                 w.message)
+                expected_message = (
+                    'Cannot place order for ASSET{sid}, as it has de-listed. '
+                    'Any existing positions for this asset will be liquidated '
+                    'on {date}.'.format(sid=sid, date=asset.auto_close_date)
+                )
+                self.assertEqual(expected_message, w.message)
 
 
 class AlgoInputValidationTestCase(ZiplineTestCase):
@@ -4096,3 +4673,83 @@ class AlgoInputValidationTestCase(ZiplineTestCase):
                     script=script,
                     **{method: lambda *args, **kwargs: None}
                 )
+
+
+class TestPanelData(ZiplineTestCase):
+
+    @parameterized.expand([
+        ('daily',
+         pd.Timestamp('2015-12-23', tz='UTC'),
+         pd.Timestamp('2016-01-05', tz='UTC'),),
+        ('minute',
+         pd.Timestamp('2015-12-23', tz='UTC'),
+         pd.Timestamp('2015-12-24', tz='UTC'),),
+    ])
+    def test_panel_data(self, data_frequency, start_dt, end_dt):
+        trading_calendar = get_calendar('NYSE')
+        if data_frequency == 'daily':
+            history_freq = '1d'
+            create_df_for_asset = create_daily_df_for_asset
+            dt_transform = trading_calendar.minute_to_session_label
+        elif data_frequency == 'minute':
+            history_freq = '1m'
+            create_df_for_asset = create_minute_df_for_asset
+
+            def dt_transform(dt):
+                return dt
+
+        sids = range(1, 3)
+        dfs = {}
+        for sid in sids:
+            dfs[sid] = create_df_for_asset(trading_calendar,
+                                           start_dt, end_dt, interval=sid)
+            dfs[sid]['prev_close'] = dfs[sid]['close'].shift(1)
+        panel = pd.Panel(dfs)
+
+        price_record = pd.Panel(items=sids,
+                                major_axis=panel.major_axis,
+                                minor_axis=['current', 'previous'])
+
+        def initialize(algo):
+            algo.first_bar = True
+            algo.equities = []
+            for sid in sids:
+                algo.equities.append(algo.sid(sid))
+
+        def handle_data(algo, data):
+            price_record.loc[:, dt_transform(algo.get_datetime()),
+                             'current'] = (
+                data.current(algo.equities, 'price')
+            )
+            if algo.first_bar:
+                algo.first_bar = False
+            else:
+                price_record.loc[:, dt_transform(algo.get_datetime()),
+                                 'previous'] = (
+                    data.history(algo.equities, 'price',
+                                 2, history_freq).iloc[0]
+                )
+
+        def check_panels():
+            np.testing.assert_array_equal(
+                price_record.values.astype('float64'),
+                panel.loc[:, :, ['close',
+                                 'prev_close']].values.astype('float64')
+            )
+
+        trading_algo = TradingAlgorithm(initialize=initialize,
+                                        handle_data=handle_data)
+        trading_algo.run(data=panel)
+        check_panels()
+        price_record.loc[:] = np.nan
+
+        run_algorithm(
+            start=start_dt,
+            end=end_dt,
+            capital_base=1,
+            initialize=initialize,
+            handle_data=handle_data,
+            data_frequency=data_frequency,
+            data=panel
+        )
+        check_panels()

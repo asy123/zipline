@@ -34,13 +34,14 @@ from numpy cimport int64_t
 import warnings
 cimport numpy as np
 
+from zipline.utils.calendars import get_calendar
+
 
 # IMPORTANT NOTE: You must change this template if you change
 # Asset.__reduce__, or else we'll attempt to unpickle an old version of this
 # class
-from pandas.tslib import normalize_date
+CACHE_FILE_TEMPLATE = '/tmp/.%s-%s.v7.cache'
 
-CACHE_FILE_TEMPLATE = '/tmp/.%s-%s.v6.cache'
 
 cdef class Asset:
 
@@ -57,6 +58,7 @@ cdef class Asset:
     cdef readonly object auto_close_date
 
     cdef readonly object exchange
+    cdef readonly object exchange_full
 
     _kwargnames = frozenset({
         'sid',
@@ -67,23 +69,27 @@ cdef class Asset:
         'first_traded',
         'auto_close_date',
         'exchange',
+        'exchange_full',
     })
 
     def __init__(self,
                  int sid, # sid is required
+                 object exchange, # exchange is required
                  object symbol="",
                  object asset_name="",
                  object start_date=None,
                  object end_date=None,
                  object first_traded=None,
                  object auto_close_date=None,
-                 object exchange=""):
+                 object exchange_full=None):
 
         self.sid = sid
         self.sid_hash = hash(sid)
         self.symbol = symbol
         self.asset_name = asset_name
         self.exchange = exchange
+        self.exchange_full = (exchange_full if exchange_full is not None
+                              else exchange)
         self.start_date = start_date
         self.end_date = end_date
         self.first_traded = first_traded
@@ -157,13 +163,14 @@ cdef class Asset:
         be serialized/deserialized during pickling.
         """
         return (self.__class__, (self.sid,
+                                 self.exchange,
                                  self.symbol,
                                  self.asset_name,
                                  self.start_date,
                                  self.end_date,
                                  self.first_traded,
                                  self.auto_close_date,
-                                 self.exchange,))
+                                 self.exchange_full))
 
     cpdef to_dict(self):
         """
@@ -178,6 +185,7 @@ cdef class Asset:
             'first_traded': self.first_traded,
             'auto_close_date': self.auto_close_date,
             'exchange': self.exchange,
+            'exchange_full': self.exchange_full,
         }
 
     @classmethod
@@ -187,44 +195,48 @@ cdef class Asset:
         """
         return cls(**dict_)
 
-    def _is_alive(self, dt, bool normalized):
+    def is_alive_for_session(self, session_label):
         """
         Returns whether the asset is alive at the given dt.
 
         Parameters
         ----------
-        dt: pd.Timestamp
-            The desired timestamp.
-
-        normalized: boolean
-            Whether the date has already been normalized.  If not, we need
-            to first normalize the date before doing the alive check.  If the
-            date is already normalized, this method runs up to 80% faster.
+        session_label: pd.Timestamp
+            The desired session label to check. (midnight UTC)
 
         Returns
         -------
         boolean: whether the asset is alive at the given dt.
         """
-        cdef int64_t dt_value
         cdef int64_t ref_start
         cdef int64_t ref_end
-
-        if not normalized:
-            dt_value = normalize_date(dt).value
-        else:
-            dt_value = dt.value
 
         ref_start = self.start_date.value
         ref_end = self.end_date.value
 
-        return ref_start <= dt_value <= ref_end
+        return ref_start <= session_label.value <= ref_end
+
+    def is_exchange_open(self, dt_minute):
+        """
+        Parameters
+        ----------
+        dt_minute: pd.Timestamp (UTC, tz-aware)
+            The minute to check.
+
+        Returns
+        -------
+        boolean: whether the asset's exchange is open at the given minute.
+        """
+        calendar = get_calendar(self.exchange)
+        return calendar.is_open_on_minute(dt_minute)
 
 
 cdef class Equity(Asset):
 
     def __repr__(self):
         attrs = ('symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded', 'auto_close_date')
+                 'start_date', 'end_date', 'first_traded', 'auto_close_date',
+                 'exchange_full')
         tuples = ((attr, repr(getattr(self, attr, None)))
                   for attr in attrs)
         strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
@@ -287,10 +299,12 @@ cdef class Future(Asset):
         'exchange',
         'tick_size',
         'multiplier',
+        'exchange_full',
     })
 
     def __init__(self,
                  int sid, # sid is required
+                 object exchange, # exchange is required
                  object symbol="",
                  object root_symbol="",
                  object asset_name="",
@@ -300,19 +314,20 @@ cdef class Future(Asset):
                  object expiration_date=None,
                  object auto_close_date=None,
                  object first_traded=None,
-                 object exchange="",
                  object tick_size="",
-                 float multiplier=1.0):
+                 float multiplier=1.0,
+                 object exchange_full=None):
 
         super().__init__(
             sid,
+            exchange,
             symbol=symbol,
             asset_name=asset_name,
             start_date=start_date,
             end_date=end_date,
             first_traded=first_traded,
             auto_close_date=auto_close_date,
-            exchange=exchange,
+            exchange_full=exchange_full,
         )
         self.root_symbol = root_symbol
         self.notice_date = notice_date
@@ -332,7 +347,7 @@ cdef class Future(Asset):
         attrs = ('symbol', 'root_symbol', 'asset_name', 'exchange',
                  'start_date', 'end_date', 'first_traded', 'notice_date',
                  'expiration_date', 'auto_close_date', 'tick_size',
-                 'multiplier')
+                 'multiplier', 'exchange_full')
         tuples = ((attr, repr(getattr(self, attr, None)))
                   for attr in attrs)
         strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
@@ -347,6 +362,7 @@ cdef class Future(Asset):
         be serialized/deserialized during pickling.
         """
         return (self.__class__, (self.sid,
+                                 self.exchange,
                                  self.symbol,
                                  self.root_symbol,
                                  self.asset_name,
@@ -356,9 +372,9 @@ cdef class Future(Asset):
                                  self.expiration_date,
                                  self.auto_close_date,
                                  self.first_traded,
-                                 self.exchange,
                                  self.tick_size,
-                                 self.multiplier,))
+                                 self.multiplier,
+                                 self.exchange_full))
 
     cpdef to_dict(self):
         """

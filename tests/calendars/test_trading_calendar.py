@@ -19,7 +19,6 @@ from os.path import (
     join,
 )
 from unittest import TestCase
-from collections import namedtuple
 
 import numpy as np
 import pandas as pd
@@ -28,59 +27,111 @@ from pandas import read_csv
 from pandas.tslib import Timedelta
 from pandas.util.testing import assert_index_equal
 from pytz import timezone
+from toolz import concat
 
 from zipline.errors import (
     CalendarNameCollision,
     InvalidCalendarName,
 )
 
+from zipline.testing.predicates import assert_equal
 from zipline.utils.calendars import(
     register_calendar,
     deregister_calendar,
     get_calendar,
-    clear_calendars,
 )
-from zipline.utils.calendars.trading_calendar import days_at_time
+from zipline.utils.calendars.calendar_utils import (
+    _default_calendar_aliases,
+    _default_calendar_factories,
+    register_calendar_type,
+
+)
+from zipline.utils.calendars.trading_calendar import days_at_time, \
+    TradingCalendar
+
+
+class FakeCalendar(TradingCalendar):
+    @property
+    def name(self):
+        return "DMY"
+
+    @property
+    def tz(self):
+        return "Asia/Ulaanbaatar"
+
+    @property
+    def open_time(self):
+        return time(11, 13)
+
+    @property
+    def close_time(self):
+        return time(11, 49)
 
 
 class CalendarRegistrationTestCase(TestCase):
-
     def setUp(self):
-        self.dummy_cal_type = namedtuple('DummyCal', ('name'))
+        self.dummy_cal_type = FakeCalendar
 
     def tearDown(self):
-        clear_calendars()
+        deregister_calendar('DMY')
 
     def test_register_calendar(self):
         # Build a fake calendar
-        dummy_cal = self.dummy_cal_type('DMY')
+        dummy_cal = self.dummy_cal_type()
 
         # Try to register and retrieve the calendar
-        register_calendar(dummy_cal)
+        register_calendar('DMY', dummy_cal)
         retr_cal = get_calendar('DMY')
         self.assertEqual(dummy_cal, retr_cal)
 
         # Try to register again, expecting a name collision
         with self.assertRaises(CalendarNameCollision):
-            register_calendar(dummy_cal)
+            register_calendar('DMY', dummy_cal)
 
         # Deregister the calendar and ensure that it is removed
         deregister_calendar('DMY')
         with self.assertRaises(InvalidCalendarName):
             get_calendar('DMY')
 
+    def test_register_calendar_type(self):
+        register_calendar_type("DMY", self.dummy_cal_type)
+        retr_cal = get_calendar("DMY")
+        self.assertEqual(self.dummy_cal_type, type(retr_cal))
+
+    def test_both_places_are_checked(self):
+        dummy_cal = self.dummy_cal_type()
+
+        # if instance is registered, can't register type with same name
+        register_calendar('DMY', dummy_cal)
+        with self.assertRaises(CalendarNameCollision):
+            register_calendar_type('DMY', type(dummy_cal))
+
+        deregister_calendar('DMY')
+
+        # if type is registered, can't register instance with same name
+        register_calendar_type('DMY', type(dummy_cal))
+
+        with self.assertRaises(CalendarNameCollision):
+            register_calendar('DMY', dummy_cal)
+
     def test_force_registration(self):
-        dummy_nyse = self.dummy_cal_type('NYSE')
+        register_calendar("DMY", self.dummy_cal_type())
+        first_dummy = get_calendar("DMY")
 
-        # Get the actual NYSE calendar
-        real_nyse = get_calendar('NYSE')
+        # force-register a new instance
+        register_calendar("DMY", self.dummy_cal_type(), force=True)
 
-        # Force a registration of the dummy NYSE
-        register_calendar(dummy_nyse, force=True)
+        second_dummy = get_calendar("DMY")
 
-        # Ensure that the dummy overwrote the real calendar
-        retr_cal = get_calendar('NYSE')
-        self.assertNotEqual(real_nyse, retr_cal)
+        self.assertNotEqual(first_dummy, second_dummy)
+
+
+class DefaultsTestCase(TestCase):
+    def test_default_calendars(self):
+        for name in concat([_default_calendar_factories,
+                            _default_calendar_aliases]):
+            self.assertIsNotNone(get_calendar(name),
+                                 "get_calendar(%r) returned None" % name)
 
 
 class DaysAtTimeTestCase(TestCase):
@@ -396,6 +447,24 @@ class ExchangeCalendarTestBase(object):
                         direction="none"
                     )
 
+    @parameterized.expand([
+        (1, 0),
+        (2, 0),
+        (2, 1),
+    ])
+    def test_minute_index_to_session_labels(self, interval, offset):
+        minutes = self.calendar.minutes_for_sessions_in_range(
+            pd.Timestamp('2011-01-04', tz='UTC'),
+            pd.Timestamp('2011-04-04', tz='UTC'),
+        )
+        minutes = minutes[range(offset, len(minutes), interval)]
+
+        np.testing.assert_array_equal(
+            np.array(minutes.map(self.calendar.minute_to_session_label),
+                     dtype='datetime64[ns]'),
+            self.calendar.minute_index_to_session_labels(minutes)
+        )
+
     def test_next_prev_session(self):
         session_labels = self.answers.index[1:-2]
         max_idx = len(session_labels) - 1
@@ -604,8 +673,32 @@ class ExchangeCalendarTestBase(object):
             found_open, found_close = \
                 self.calendar.open_and_close_for_session(session_label)
 
+            # Test that the methods for just session open and close produce the
+            # same values as the method for getting both.
+            alt_open = self.calendar.session_open(session_label)
+            self.assertEqual(alt_open, found_open)
+
+            alt_close = self.calendar.session_close(session_label)
+            self.assertEqual(alt_close, found_close)
+
             self.assertEqual(open_answer, found_open)
             self.assertEqual(close_answer, found_close)
+
+    def test_session_opens_in_range(self):
+        found_opens = self.calendar.session_opens_in_range(
+            self.answers.index[0],
+            self.answers.index[-1],
+        )
+
+        assert_equal(found_opens, self.answers['market_open'])
+
+    def test_session_closes_in_range(self):
+        found_closes = self.calendar.session_closes_in_range(
+            self.answers.index[0],
+            self.answers.index[-1],
+        )
+
+        assert_equal(found_closes, self.answers['market_close'])
 
     def test_daylight_savings(self):
         # 2004 daylight savings switches:

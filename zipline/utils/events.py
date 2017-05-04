@@ -15,12 +15,18 @@
 from abc import ABCMeta, abstractmethod
 from collections import namedtuple
 import six
+import warnings
 
 import datetime
+import numpy as np
 import pandas as pd
 import pytz
+from toolz import curry
 
+from zipline.utils.input_validation import preprocess
 from zipline.utils.memoize import lazyval
+from zipline.utils.sentinel import sentinel
+
 from .context_tricks import nop_context
 
 
@@ -45,6 +51,7 @@ __all__ = [
     # Factory API
     'date_rules',
     'time_rules',
+    'calendars',
     'make_eventrule',
 ]
 
@@ -90,12 +97,12 @@ def _out_of_range_error(a, b=None, var='offset'):
 def _td_check(td):
     seconds = td.total_seconds()
 
-    # 23400 seconds is 6 hours and 30 minutes.
-    if 60 <= seconds <= 23400:
+    # 43200 seconds = 12 hours
+    if 60 <= seconds <= 43200:
         return td
     else:
-        raise ValueError('offset must be in between 1 minute and 6 hours and'
-                         ' 30 minutes inclusive')
+        raise ValueError('offset must be in between 1 minute and 12 hours, '
+                         'inclusive.')
 
 
 def _build_offset(offset, kwargs, default):
@@ -145,6 +152,31 @@ def _build_time(time, kwargs):
         raise ValueError('Must pass a time or kwargs')
     else:
         return datetime.time(**kwargs)
+
+
+@curry
+def lossless_float_to_int(funcname, func, argname, arg):
+    """
+    A preprocessor that coerces integral floats to ints.
+
+    Receipt of non-integral floats raises a TypeError.
+    """
+    if not isinstance(arg, float):
+        return arg
+
+    arg_as_int = int(arg)
+    if arg == arg_as_int:
+        warnings.warn(
+            "{f} expected an int for argument {name!r}, but got float {arg}."
+            " Coercing to int.".format(
+                f=funcname,
+                name=argname,
+                arg=arg,
+            ),
+        )
+        return arg_as_int
+
+    raise TypeError(arg)
 
 
 class EventManager(object):
@@ -318,11 +350,19 @@ class AfterOpen(StatelessRule):
         self._one_minute = datetime.timedelta(minutes=1)
 
     def calculate_dates(self, dt):
-        # given a dt, find that day's open and period end (open + offset)
-        self._period_start, self._period_close = \
-            self.cal.open_and_close_for_session(
-                self.cal.minute_to_session_label(dt, direction="none")
-            )
+        """
+        Given a date, find that day's open and period end (open + offset).
+        """
+        period_start, period_close = self.cal.open_and_close_for_session(
+            self.cal.minute_to_session_label(dt),
+        )
+
+        # Align the market open and close times here with the execution times
+        # used by the simulation clock. This ensures that scheduled functions
+        # trigger at the correct times.
+        self._period_start = self.cal.execution_time_from_open(period_start)
+        self._period_close = self.cal.execution_time_from_close(period_close)
+
         self._period_end = self._period_start + self.offset - self._one_minute
 
     def should_trigger(self, dt):
@@ -366,11 +406,17 @@ class BeforeClose(StatelessRule):
         self._one_minute = datetime.timedelta(minutes=1)
 
     def calculate_dates(self, dt):
-        # given a dt, find that day's close and period start (close - offset)
-        self._period_end = \
-            self.cal.open_and_close_for_session(
-                self.cal.minute_to_session_label(dt)
-            )[1]
+        """
+        Given a dt, find that day's close and period start (close - offset).
+        """
+        period_end = self.cal.open_and_close_for_session(
+            self.cal.minute_to_session_label(dt),
+        )[1]
+
+        # Align the market close time here with the execution time used by the
+        # simulation clock. This ensures that scheduled functions trigger at
+        # the correct times.
+        self._period_end = self.cal.execution_time_from_close(period_end)
 
         self._period_start = self._period_end - self.offset
         self._period_close = self._period_end
@@ -396,28 +442,33 @@ class NotHalfDay(StatelessRule):
     A rule that only triggers when it is not a half day.
     """
     def should_trigger(self, dt):
-        return self.cal.minute_to_session_label(dt, direction="none") \
+        return self.cal.minute_to_session_label(dt) \
             not in self.cal.early_closes
 
 
 class TradingDayOfWeekRule(six.with_metaclass(ABCMeta, StatelessRule)):
+    @preprocess(n=lossless_float_to_int('TradingDayOfWeekRule'))
     def __init__(self, n, invert):
         if not 0 <= n < MAX_WEEK_RANGE:
             raise _out_of_range_error(MAX_WEEK_RANGE)
 
         self.td_delta = (-n - 1) if invert else n
 
-    @lazyval
-    def execution_periods(self):
-        # calculate the list of periods that match the given criteria
-        return self.cal.schedule.groupby(
-            pd.Grouper(freq="W")
-        ).nth(int(self.td_delta)).index
-
     def should_trigger(self, dt):
         # is this market minute's period in the list of execution periods?
-        return self.cal.minute_to_session_label(dt, direction="none") in \
-            self.execution_periods
+        val = self.cal.minute_to_session_label(dt, direction="none").value
+        return val in self.execution_period_values
+
+    @lazyval
+    def execution_period_values(self):
+        # calculate the list of periods that match the given criteria
+        sessions = self.cal.all_sessions
+        return set(
+            pd.Series(data=sessions)
+            .groupby([sessions.year, sessions.weekofyear])
+            .nth(self.td_delta)
+            .astype(np.int64)
+        )
 
 
 class NthTradingDayOfWeek(TradingDayOfWeekRule):
@@ -438,6 +489,8 @@ class NDaysBeforeLastTradingDayOfWeek(TradingDayOfWeekRule):
 
 
 class TradingDayOfMonthRule(six.with_metaclass(ABCMeta, StatelessRule)):
+
+    @preprocess(n=lossless_float_to_int('TradingDayOfMonthRule'))
     def __init__(self, n, invert):
         if not 0 <= n < MAX_MONTH_RANGE:
             raise _out_of_range_error(MAX_MONTH_RANGE)
@@ -448,15 +501,19 @@ class TradingDayOfMonthRule(six.with_metaclass(ABCMeta, StatelessRule)):
 
     def should_trigger(self, dt):
         # is this market minute's period in the list of execution periods?
-        return self.cal.minute_to_session_label(dt, direction="none") in \
-            self.execution_periods
+        value = self.cal.minute_to_session_label(dt, direction="none").value
+        return value in self.execution_period_values
 
     @lazyval
-    def execution_periods(self):
+    def execution_period_values(self):
         # calculate the list of periods that match the given criteria
-        return self.cal.schedule.groupby(
-            pd.Grouper(freq="M")
-        ).nth(int(self.td_delta)).index
+        sessions = self.cal.all_sessions
+        return set(
+            pd.Series(data=sessions)
+            .groupby([sessions.year, sessions.month])
+            .nth(self.td_delta)
+            .astype(np.int64)
+        )
 
 
 class NthTradingDayOfMonth(TradingDayOfMonthRule):
@@ -546,6 +603,11 @@ class time_rules(object):
     market_open = AfterOpen
     market_close = BeforeClose
     every_minute = Always
+
+
+class calendars(object):
+    US_EQUITIES = sentinel('US_EQUITIES')
+    US_FUTURES = sentinel('US_FUTURES')
 
 
 def make_eventrule(date_rule, time_rule, cal, half_days=True):

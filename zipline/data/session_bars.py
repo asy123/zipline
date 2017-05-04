@@ -1,4 +1,4 @@
-# Copyright 2015 Quantopian, Inc.
+# Copyright 2016 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,17 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from abc import abstractproperty
+
+from zipline.data.bar_reader import BarReader
 
 
-class FutureDailyReader(object):
+class SessionBarReader(BarReader):
     """
-    Stubbed out. Currently unimplemented.
+    Reader for OHCLV pricing data at a session frequency.
     """
-    pass
+    @property
+    def data_frequency(self):
+        return 'session'
 
-
-class FutureMinuteReader(object):
-
-    def __init__(self, rootdir, sid_path_func=None):
-        self.rootdir = rootdir
-        self.sid_path_func = sid_path_func
+    @abstractproperty
+    def sessions(self):
+        """
+        Returns
+        -------
+        sessions : DatetimeIndex
+           All session labels (unionining the range for all assets) which the
+           reader can provide.
+        """
+        pass

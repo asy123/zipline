@@ -39,6 +39,7 @@ from zipline.data.us_equity_pricing import (
     BcolzDailyBarWriter,
     SQLiteAdjustmentWriter,
 )
+from zipline.finance.blotter import Blotter
 from zipline.finance.trading import TradingEnvironment
 from zipline.finance.order import ORDER_STATUS
 from zipline.lib.labelarray import LabelArray
@@ -47,9 +48,12 @@ from zipline.pipeline.engine import SimplePipelineEngine
 from zipline.pipeline.factors import CustomFactor
 from zipline.pipeline.loaders.testing import make_seeded_random_loader
 from zipline.utils import security_list
-from zipline.utils.input_validation import expect_dimensions
-from zipline.utils.sentinel import sentinel
 from zipline.utils.calendars import get_calendar
+from zipline.utils.input_validation import expect_dimensions
+from zipline.utils.numpy_utils import as_column, isnat
+from zipline.utils.pandas_utils import timedelta_to_integral_seconds
+from zipline.utils.sentinel import sentinel
+
 import numpy as np
 from numpy import float64
 
@@ -76,7 +80,7 @@ def str_to_seconds(s):
     >>> str_to_seconds('2014-01-01')
     1388534400
     """
-    return int((pd.Timestamp(s, tz='UTC') - EPOCH).total_seconds())
+    return timedelta_to_integral_seconds(pd.Timestamp(s, tz='UTC') - EPOCH)
 
 
 def drain_zipline(test, zipline):
@@ -308,11 +312,11 @@ def make_trade_data_for_asset_info(dates,
     price_sid_deltas = np.arange(len(sids), dtype=float64) * price_step_by_sid
     price_date_deltas = (np.arange(len(dates), dtype=float64) *
                          price_step_by_date)
-    prices = (price_sid_deltas + price_date_deltas[:, None]) + price_start
+    prices = (price_sid_deltas + as_column(price_date_deltas)) + price_start
 
     volume_sid_deltas = np.arange(len(sids)) * volume_step_by_sid
     volume_date_deltas = np.arange(len(dates)) * volume_step_by_date
-    volumes = (volume_sid_deltas + volume_date_deltas[:, None]) + volume_start
+    volumes = volume_sid_deltas + as_column(volume_date_deltas) + volume_start
 
     for j, sid in enumerate(sids):
         start_date, end_date = asset_info.loc[sid, ['start_date', 'end_date']]
@@ -391,6 +395,18 @@ def check_arrays(x, y, err_msg='', verbose=True, check_dtypes=True):
         # ...then check the actual values as well.
         x = x.as_string_array()
         y = y.as_string_array()
+    elif x.dtype.kind in 'mM':
+        x_isnat = isnat(x)
+        y_isnat = isnat(y)
+        assert_array_equal(
+            x_isnat,
+            y_isnat,
+            err_msg="NaTs not equal",
+            verbose=verbose,
+        )
+        # Fill NaTs with zero for comparison.
+        x = np.where(x_isnat, np.zeros_like(x), x)
+        y = np.where(y_isnat, np.zeros_like(y), y)
 
     return assert_array_equal(x, y, err_msg=err_msg, verbose=verbose)
 
@@ -438,7 +454,7 @@ def create_minute_bar_data(minutes, sids):
                 'high': np.arange(length) + 15 + sid_idx,
                 'low': np.arange(length) + 8 + sid_idx,
                 'close': np.arange(length) + 10 + sid_idx,
-                'volume': np.arange(length) + 100 + sid_idx,
+                'volume': 100 + sid_idx,
             },
             index=minutes,
         )
@@ -505,14 +521,11 @@ def create_data_portal(asset_finder, tempdir, sim_params, sids,
 
 
 def write_bcolz_minute_data(trading_calendar, days, path, data):
-    market_opens = trading_calendar.schedule.loc[days].market_open
-    market_closes = trading_calendar.schedule.loc[days].market_close
-
     BcolzMinuteBarWriter(
-        days[0],
         path,
-        market_opens,
-        market_closes,
+        trading_calendar,
+        days[0],
+        days[-1],
         US_EQUITIES_MINUTES_PER_DAY
     ).write(data)
 
@@ -592,11 +605,11 @@ def trades_by_sid_to_dfs(trades_by_sid, index):
         closes = []
         volumes = []
         for trade in trades:
-            opens.append(trade["open_price"])
-            highs.append(trade["high"])
-            lows.append(trade["low"])
-            closes.append(trade["close_price"])
-            volumes.append(trade["volume"])
+            opens.append(trade.open_price)
+            highs.append(trade.high)
+            lows.append(trade.low)
+            closes.append(trade.close_price)
+            volumes.append(trade.volume)
 
         yield sidint, pd.DataFrame(
             {
@@ -710,7 +723,7 @@ class FakeDataPortal(DataPortal):
             ]
 
             df = pd.DataFrame(
-                np.full((bar_count, len(assets)), 100),
+                np.full((bar_count, len(assets)), 100.0),
                 index=days,
                 columns=assets
             )
@@ -736,6 +749,9 @@ class FetcherDataPortal(DataPortal):
         # otherwise just return a fixed value
         return int(asset)
 
+    # XXX: These aren't actually the methods that are used by the superclasses,
+    # so these don't do anything, and this class will likely produce unexpected
+    # results for history().
     def _get_daily_window_for_sid(self, asset, field, days_in_window,
                                   extra_slot=True):
         return np.arange(days_in_window, dtype=np.float64)
@@ -960,7 +976,7 @@ def subtest(iterator, *_names):
 
 
 class MockDailyBarReader(object):
-    def spot_price(self, col, sid, dt):
+    def get_value(self, col, sid, dt):
         return 100
 
 
@@ -1068,7 +1084,9 @@ def temp_pipeline_engine(calendar, sids, random_seed, symbols=None):
     )
 
     loader = make_seeded_random_loader(random_seed, calendar, sids)
-    get_loader = lambda column: loader
+
+    def get_loader(column):
+        return loader
 
     with tmp_asset_finder(equities=equity_info) as finder:
         yield SimplePipelineEngine(get_loader, calendar, finder)
@@ -1124,16 +1142,20 @@ def parameter_space(__fail_fast=False, **params):
                 "supplied to parameter_space()." % extra
             )
 
-        param_sets = product(*(params[name] for name in argnames))
+        make_param_sets = lambda: product(*(params[name] for name in argnames))
 
         if __fail_fast:
             @wraps(f)
             def wrapped(self):
-                for args in param_sets:
+                for args in make_param_sets():
                     f(self, *args)
             return wrapped
         else:
-            return subtest(param_sets, *argnames)(f)
+            @wraps(f)
+            def wrapped(*args, **kwargs):
+                subtest(make_param_sets(), *argnames)(f)(*args, **kwargs)
+
+        return wrapped
 
     return decorator
 
@@ -1485,6 +1507,18 @@ def ensure_doctest(f, name=None):
         f.__name__ if name is None else name
     ] = f
     return f
+
+
+class RecordBatchBlotter(Blotter):
+    """Blotter that tracks how its batch_order method was called.
+    """
+    def __init__(self, data_frequency):
+        super(RecordBatchBlotter, self).__init__(data_frequency)
+        self.order_batch_called = []
+
+    def batch_order(self, *args, **kwargs):
+        self.order_batch_called.append((args, kwargs))
+        return super(RecordBatchBlotter, self).batch_order(*args, **kwargs)
 
 
 ####################################

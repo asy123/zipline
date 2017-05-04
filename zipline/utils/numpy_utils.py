@@ -1,18 +1,24 @@
 """
 Utilities for working with numpy arrays.
 """
+from collections import OrderedDict
 from datetime import datetime
 from warnings import (
     catch_warnings,
     filterwarnings,
 )
 
+import numpy as np
 from numpy import (
     broadcast,
     busday_count,
     datetime64,
+    diff,
     dtype,
     empty,
+    flatnonzero,
+    hstack,
+    isnan,
     nan,
     vectorize,
     where
@@ -44,7 +50,24 @@ NaTmap = {
     dtype('datetime64[%s]' % unit): datetime64('NaT', unit)
     for unit in ('ns', 'us', 'ms', 's', 'm', 'D')
 }
-NaT_for_dtype = NaTmap.__getitem__
+
+
+def NaT_for_dtype(dtype):
+    """Retrieve NaT with the same units as ``dtype``.
+
+    Parameters
+    ----------
+    dtype : dtype-coercable
+        The dtype to lookup the NaT value for.
+
+    Returns
+    -------
+    NaT : dtype
+        The NaT value for the given dtype.
+    """
+    return NaTmap[np.dtype(dtype)]
+
+
 NaTns = NaT_for_dtype(datetime64ns_dtype)
 NaTD = NaT_for_dtype(datetime64D_dtype)
 
@@ -57,12 +80,19 @@ _FILLVALUE_DEFAULTS = {
     object_dtype: None,
 }
 
-INT_DTYPES_BY_SIZE_BYTES = {
-    1: dtype('int8'),
-    2: dtype('int16'),
-    4: dtype('int32'),
-    8: dtype('int64'),
-}
+INT_DTYPES_BY_SIZE_BYTES = OrderedDict([
+    (1, dtype('int8')),
+    (2, dtype('int16')),
+    (4, dtype('int32')),
+    (8, dtype('int64')),
+])
+
+UNSIGNED_INT_DTYPES_BY_SIZE_BYTES = OrderedDict([
+    (1, dtype('uint8')),
+    (2, dtype('uint16')),
+    (4, dtype('uint32')),
+    (8, dtype('uint64')),
+])
 
 
 def int_dtype_with_size_in_bytes(size):
@@ -70,6 +100,15 @@ def int_dtype_with_size_in_bytes(size):
         return INT_DTYPES_BY_SIZE_BYTES[size]
     except KeyError:
         raise ValueError("No integral dtype whose size is %d bytes." % size)
+
+
+def unsigned_int_dtype_with_size_in_bytes(size):
+    try:
+        return UNSIGNED_INT_DTYPES_BY_SIZE_BYTES[size]
+    except KeyError:
+        raise ValueError(
+            "No unsigned integral dtype whose size is %d bytes." % size
+        )
 
 
 class NoDefaultMissingValue(Exception):
@@ -282,6 +321,28 @@ def rolling_window(array, length):
 
 # Sentinel value that isn't NaT.
 _notNaT = make_datetime64D(0)
+iNaT = NaTns.view(int64_dtype)
+assert iNaT == NaTD.view(int64_dtype), "iNaTns != iNaTD"
+
+
+def isnat(obj):
+    """
+    Check if a value is np.NaT.
+    """
+    if obj.dtype.kind not in ('m', 'M'):
+        raise ValueError("%s is not a numpy datetime or timedelta")
+    return obj.view(int64_dtype) == iNaT
+
+
+def is_missing(data, missing_value):
+    """
+    Generic is_missing function that handles NaN and NaT.
+    """
+    if is_float(data) and isnan(missing_value):
+        return isnan(data)
+    elif is_datetime(data) and isnat(missing_value):
+        return isnat(data)
+    return (data == missing_value)
 
 
 def busday_count_mask_NaT(begindates, enddates, out=None):
@@ -299,8 +360,8 @@ def busday_count_mask_NaT(begindates, enddates, out=None):
     if out is None:
         out = empty(broadcast(begindates, enddates).shape, dtype=float)
 
-    beginmask = (begindates == NaTD)
-    endmask = (enddates == NaTD)
+    beginmask = isnat(begindates)
+    endmask = isnat(enddates)
 
     out = busday_count(
         # Temporarily fill in non-NaT values.
@@ -364,3 +425,66 @@ def vectorized_is_element(array, choices):
         Array indicating whether each element of ``array`` was in ``choices``.
     """
     return vectorize(choices.__contains__, otypes=[bool])(array)
+
+
+def as_column(a):
+    """
+    Convert an array of shape (N,) into an array of shape (N, 1).
+
+    This is equivalent to `a[:, np.newaxis]`.
+
+    Parameters
+    ----------
+    a : np.ndarray
+
+    Example
+    -------
+    >>> import numpy as np
+    >>> a = np.arange(5)
+    >>> a
+    array([0, 1, 2, 3, 4])
+    >>> as_column(a)
+    array([[0],
+           [1],
+           [2],
+           [3],
+           [4]])
+    >>> as_column(a).shape
+    (5, 1)
+    """
+    if a.ndim != 1:
+        raise ValueError(
+            "as_column expected an 1-dimensional array, "
+            "but got an array of shape %s" % a.shape
+        )
+    return a[:, None]
+
+
+def changed_locations(a, include_first):
+    """
+    Compute indices of values in ``a`` that differ from the previous value.
+
+    Parameters
+    ----------
+    a : np.ndarray
+        The array on which to indices of change.
+    include_first : bool
+        Whether or not to consider the first index of the array as "changed".
+
+    Example
+    -------
+    >>> import numpy as np
+    >>> changed_locations(np.array([0, 0, 5, 5, 1, 1]), include_first=False)
+    array([2, 4])
+
+    >>> changed_locations(np.array([0, 0, 5, 5, 1, 1]), include_first=True)
+    array([0, 2, 4])
+    """
+    if a.ndim > 1:
+        raise ValueError("indices_of_changed_values only supports 1D arrays.")
+    indices = flatnonzero(diff(a)) + 1
+
+    if not include_first:
+        return indices
+
+    return hstack([[0], indices])

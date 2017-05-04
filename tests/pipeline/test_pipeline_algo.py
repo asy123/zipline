@@ -8,6 +8,7 @@ from os.path import (
 )
 
 from nose_parameterized import parameterized
+import numpy as np
 from numpy import (
     array,
     arange,
@@ -26,6 +27,7 @@ from pandas import (
     Series,
     Timestamp,
 )
+from pandas.tseries.tools import normalize_date
 from six import iteritems, itervalues
 
 from zipline.algorithm import TradingAlgorithm
@@ -284,21 +286,33 @@ class ClosesOnly(WithDataPortal, ZiplineTestCase):
                            ('day', 1),
                            ('week', 5),
                            ('year', 252),
-                           ('all_but_one_day', 'all_but_one_day')])
-    def test_assets_appear_on_correct_days(self, test_name, chunksize):
+                           ('all_but_one_day', 'all_but_one_day'),
+                           ('custom_iter', 'custom_iter')])
+    def test_assets_appear_on_correct_days(self, test_name, chunks):
         """
         Assert that assets appear at correct times during a backtest, with
         correctly-adjusted close price values.
         """
 
-        if chunksize == 'all_but_one_day':
-            chunksize = (
+        if chunks == 'all_but_one_day':
+            chunks = (
                 self.dates.get_loc(self.last_asset_end) -
                 self.dates.get_loc(self.first_asset_start)
             ) - 1
+        elif chunks == 'custom_iter':
+            chunks = []
+            st = np.random.RandomState(12345)
+            remaining = (
+                self.dates.get_loc(self.last_asset_end) -
+                self.dates.get_loc(self.first_asset_start)
+            )
+            while remaining > 0:
+                chunk = st.randint(3)
+                chunks.append(chunk)
+                remaining -= chunk
 
         def initialize(context):
-            p = attach_pipeline(Pipeline(), 'test', chunksize=chunksize)
+            p = attach_pipeline(Pipeline(), 'test', chunks=chunks)
             p.add(USEquityPricing.close.latest, 'close')
 
         def handle_data(context, data):
@@ -335,7 +349,7 @@ class MockDailyBarSpotReader(object):
     """
     A BcolzDailyBarReader which returns a constant value for spot price.
     """
-    def spot_price(self, sid, day, column):
+    def get_value(self, sid, day, column):
         return 100.0
 
 
@@ -345,7 +359,7 @@ class PipelineAlgorithmTestCase(WithBcolzEquityDailyBarReaderFromCSVs,
     AAPL = 1
     MSFT = 2
     BRK_A = 3
-    assets = ASSET_FINDER_EQUITY_SIDS = AAPL, MSFT, BRK_A
+    ASSET_FINDER_EQUITY_SIDS = AAPL, MSFT, BRK_A
     ASSET_FINDER_EQUITY_SYMBOLS = 'AAPL', 'MSFT', 'BRK_A'
     START_DATE = Timestamp('2014')
     END_DATE = Timestamp('2015')
@@ -402,6 +416,9 @@ class PipelineAlgorithmTestCase(WithBcolzEquityDailyBarReaderFromCSVs,
         )
         cls.dates = cls.raw_data[cls.AAPL].index.tz_localize('UTC')
         cls.AAPL_split_date = Timestamp("2014-06-09", tz='UTC')
+        cls.assets = cls.asset_finder.retrieve_all(
+            cls.ASSET_FINDER_EQUITY_SIDS
+        )
 
     def compute_expected_vwaps(self, window_lengths):
         AAPL, MSFT, BRK_A = self.AAPL, self.MSFT, self.BRK_A
@@ -487,7 +504,7 @@ class PipelineAlgorithmTestCase(WithBcolzEquityDailyBarReaderFromCSVs,
         (False,),
     ])
     def test_handle_adjustment(self, set_screen):
-        AAPL, MSFT, BRK_A = assets = self.AAPL, self.MSFT, self.BRK_A
+        AAPL, MSFT, BRK_A = assets = self.assets
 
         window_lengths = [1, 2, 5, 10]
         vwaps = self.compute_expected_vwaps(window_lengths)
@@ -512,7 +529,7 @@ class PipelineAlgorithmTestCase(WithBcolzEquityDailyBarReaderFromCSVs,
             attach_pipeline(pipeline, 'test')
 
         def handle_data(context, data):
-            today = get_datetime()
+            today = normalize_date(get_datetime())
             results = pipeline_output('test')
             expect_over_300 = {
                 AAPL: today < self.AAPL_split_date,

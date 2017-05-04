@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from abc import ABCMeta, abstractmethod, abstractproperty
 from errno import ENOENT
 from functools import partial
 from os import remove
@@ -35,32 +34,40 @@ from numpy import (
     issubdtype,
     nan,
     uint32,
-    zeros,
 )
 from pandas import (
     DataFrame,
-    read_csv,
-    Timestamp,
-    NaT,
+    DatetimeIndex,
     isnull,
-    DatetimeIndex)
+    NaT,
+    read_csv,
+    read_sql,
+    to_datetime,
+    Timestamp,
+)
 from pandas.tslib import iNaT
 from six import (
     iteritems,
-    with_metaclass,
+    string_types,
     viewkeys,
 )
+from toolz import compose
 
+from zipline.data.session_bars import SessionBarReader
+from zipline.data.bar_reader import (
+    NoDataAfterDate,
+    NoDataBeforeDate,
+    NoDataOnDate,
+)
 from zipline.utils.calendars import get_calendar
 from zipline.utils.functional import apply
 from zipline.utils.preprocess import call
 from zipline.utils.input_validation import (
-    coerce_string,
-    preprocess,
     expect_element,
+    preprocess,
     verify_indices_all_unique,
 )
-from zipline.utils.sqlite_utils import group_into_chunks
+from zipline.utils.sqlite_utils import group_into_chunks, coerce_string_to_conn
 from zipline.utils.memoize import lazyval
 from zipline.utils.cli import maybe_show_progress
 from ._equities import _compute_row_slices, _read_bcolz_data
@@ -99,13 +106,6 @@ SQLITE_STOCK_DIVIDEND_PAYOUT_COLUMN_DTYPES = {
     'ratio': float,
 }
 UINT32_MAX = iinfo(uint32).max
-
-
-class NoDataOnDate(Exception):
-    """
-    Raised when a spot price can be found for the sid and date.
-    """
-    pass
 
 
 def check_uint32_safe(value, colname):
@@ -162,21 +162,6 @@ def winsorise_uint32(df, invalid_data_behavior, column, *columns):
 
     df[mask] = 0
     return df
-
-
-@expect_element(invalid_data_behavior={'warn', 'raise', 'ignore'})
-def to_ctable(raw_data, invalid_data_behavior):
-    if isinstance(raw_data, ctable):
-        # we already have a ctable so do nothing
-        return raw_data
-
-    winsorise_uint32(raw_data, invalid_data_behavior, 'volume', *OHLC)
-    processed = (raw_data[list(OHLC)] * 1000).astype('uint32')
-    dates = raw_data.index.values.astype('datetime64[s]')
-    check_uint32_safe(dates.max().view(np.int64), 'day')
-    processed['day'] = dates.astype('uint32')
-    processed['volume'] = raw_data.volume.astype('uint32')
-    return ctable.fromdataframe(processed)
 
 
 class BcolzDailyBarWriter(object):
@@ -259,7 +244,10 @@ class BcolzDailyBarWriter(object):
             The newly-written table.
         """
         ctx = maybe_show_progress(
-            ((sid, to_ctable(df, invalid_data_behavior)) for sid, df in data),
+            (
+                (sid, self.to_ctable(df, invalid_data_behavior))
+                for sid, df in data
+            ),
             show_progress=show_progress,
             item_show_func=self.progress_bar_item_show_func,
             label=self.progress_bar_message,
@@ -357,15 +345,44 @@ class BcolzDailyBarWriter(object):
             last_row[asset_key] = total_rows + nrows - 1
             total_rows += nrows
 
+            table_day_to_session = compose(
+                self._calendar.minute_to_session_label,
+                partial(Timestamp, unit='s', tz='UTC'),
+            )
+            asset_first_day = table_day_to_session(table['day'][0])
+            asset_last_day = table_day_to_session(table['day'][-1])
+
+            asset_sessions = sessions[
+                sessions.slice_indexer(asset_first_day, asset_last_day)
+            ]
+            assert len(table) == len(asset_sessions), (
+                'Got {} rows for daily bars table with first day={}, last '
+                'day={}, expected {} rows.\n'
+                'Missing sessions: {}\n'
+                'Extra sessions: {}'.format(
+                    len(table),
+                    asset_first_day.date(),
+                    asset_last_day.date(),
+                    len(asset_sessions),
+                    asset_sessions.difference(
+                        to_datetime(
+                            np.array(table['day']),
+                            unit='s',
+                            utc=True,
+                        )
+                    ).tolist(),
+                    to_datetime(
+                        np.array(table['day']),
+                        unit='s',
+                        utc=True,
+                    ).difference(asset_sessions).tolist(),
+                )
+            )
+
             # Calculate the number of trading days between the first date
             # in the stored data and the first date of **this** asset. This
             # offset used for output alignment by the reader.
-            asset_first_day = table['day'][0]
-            calendar_offset[asset_key] = sessions.get_loc(
-                self._calendar.minute_to_session_label(
-                    Timestamp(asset_first_day, unit='s', tz='UTC')
-                )
-            )
+            calendar_offset[asset_key] = sessions.get_loc(asset_first_day)
 
         # This writes the table to disk.
         full_table = ctable(
@@ -391,37 +408,22 @@ class BcolzDailyBarWriter(object):
         full_table.flush()
         return full_table
 
+    @expect_element(invalid_data_behavior={'warn', 'raise', 'ignore'})
+    def to_ctable(self, raw_data, invalid_data_behavior):
+        if isinstance(raw_data, ctable):
+            # we already have a ctable so do nothing
+            return raw_data
 
-class DailyBarReader(with_metaclass(ABCMeta)):
-    """
-    Reader for OHCLV pricing data at a daily frequency.
-    """
-    @abstractmethod
-    def load_raw_arrays(self, columns, start_date, end_date, assets):
-        pass
-
-    @abstractmethod
-    def spot_price(self, sid, day, colname):
-        pass
-
-    @abstractproperty
-    def sessions(self):
-        pass
-
-    @abstractproperty
-    def last_available_dt(self):
-        pass
-
-    @abstractproperty
-    def trading_calendar(self):
-        """
-        Returns the zipline.utils.calendar.trading_calendar used to read
-         the data.  Can be None (if the writer didn't specify it).
-        """
-        pass
+        winsorise_uint32(raw_data, invalid_data_behavior, 'volume', *OHLC)
+        processed = (raw_data[list(OHLC)] * 1000).astype('uint32')
+        dates = raw_data.index.values.astype('datetime64[s]')
+        check_uint32_safe(dates.max().view(np.int64), 'day')
+        processed['day'] = dates.astype('uint32')
+        processed['volume'] = raw_data.volume.astype('uint32')
+        return ctable.fromdataframe(processed)
 
 
-class BcolzDailyBarReader(DailyBarReader):
+class BcolzDailyBarReader(SessionBarReader):
     """
     Reader for raw pricing data written by BcolzDailyOHLCVWriter.
 
@@ -662,26 +664,27 @@ class BcolzDailyBarReader(DailyBarReader):
     def get_last_traded_dt(self, asset, day):
         volumes = self._spot_col('volume')
 
-        if day >= asset.end_date:
-            # go back to one day before the asset ended
-            search_day = self.sessions[
-                self.sessions.searchsorted(asset.end_date) - 1
-            ]
-        else:
-            search_day = day
+        search_day = day
 
         while True:
             try:
                 ix = self.sid_day_index(asset, search_day)
+            except NoDataBeforeDate:
+                return NaT
+            except NoDataAfterDate:
+                prev_day_ix = self.sessions.get_loc(search_day) - 1
+                if prev_day_ix > -1:
+                    search_day = self.sessions[prev_day_ix]
+                continue
             except NoDataOnDate:
-                return None
+                return NaT
             if volumes[ix] != 0:
                 return search_day
             prev_day_ix = self.sessions.get_loc(search_day) - 1
             if prev_day_ix > -1:
                 search_day = self.sessions[prev_day_ix]
             else:
-                return None
+                return NaT
 
     def sid_day_index(self, sid, day):
         """
@@ -706,17 +709,17 @@ class BcolzDailyBarReader(DailyBarReader):
                 day, self.sessions))
         offset = day_loc - self._calendar_offsets[sid]
         if offset < 0:
-            raise NoDataOnDate(
+            raise NoDataBeforeDate(
                 "No data on or before day={0} for sid={1}".format(
                     day, sid))
         ix = self._first_rows[sid] + offset
         if ix > self._last_rows[sid]:
-            raise NoDataOnDate(
+            raise NoDataAfterDate(
                 "No data on or after day={0} for sid={1}".format(
                     day, sid))
         return ix
 
-    def spot_price(self, sid, day, colname):
+    def get_value(self, sid, dt, field):
         """
         Parameters
         ----------
@@ -736,17 +739,18 @@ class BcolzDailyBarReader(DailyBarReader):
             Returns -1 if the day is within the date range, but the price is
             0.
         """
-        ix = self.sid_day_index(sid, day)
-        price = self._spot_col(colname)[ix]
-        if price == 0:
-            return -1
-        if colname != 'volume':
-            return price * 0.001
+        ix = self.sid_day_index(sid, dt)
+        price = self._spot_col(field)[ix]
+        if field != 'volume':
+            if price == 0:
+                return nan
+            else:
+                return price * 0.001
         else:
             return price
 
 
-class PanelDailyBarReader(DailyBarReader):
+class PanelBarReader(SessionBarReader):
     """
     Reader for data passed as Panel.
 
@@ -770,46 +774,54 @@ class PanelDailyBarReader(DailyBarReader):
         The first trading day in the dataset.
     """
     @preprocess(panel=call(verify_indices_all_unique))
-    def __init__(self, calendar, panel):
+    @expect_element(data_frequency={'daily', 'minute'})
+    def __init__(self, trading_calendar, panel, data_frequency):
 
         panel = panel.copy()
         if 'volume' not in panel.minor_axis:
             # Fake volume if it does not exist.
             panel.loc[:, :, 'volume'] = int(1e9)
 
-        self.first_trading_day = panel.major_axis[0]
-        self._calendar = calendar
+        self.trading_calendar = trading_calendar
+        self._first_trading_day = trading_calendar.minute_to_session_label(
+            panel.major_axis[0]
+        )
+        last_trading_day = trading_calendar.minute_to_session_label(
+            panel.major_axis[-1]
+        )
+
+        self.sessions = trading_calendar.sessions_in_range(
+            self.first_trading_day,
+            last_trading_day
+        )
+
+        if data_frequency == 'daily':
+            self._calendar = self.sessions
+        elif data_frequency == 'minute':
+            self._calendar = trading_calendar.minutes_for_sessions_in_range(
+                self.first_trading_day,
+                last_trading_day
+            )
 
         self.panel = panel
 
-    @property
-    def sessions(self):
-        return self._calendar
+    sessions = None
 
     @property
     def last_available_dt(self):
         return self._calendar[-1]
 
-    @property
-    def trading_calendar(self):
-        return None
+    trading_calendar = None
 
-    def load_raw_arrays(self, columns, start_date, end_date, assets):
-        columns = list(columns)
+    def load_raw_arrays(self, columns, start_dt, end_dt, assets):
         cal = self._calendar
-        index = cal[cal.slice_indexer(start_date, end_date)]
-        shape = (len(index), len(assets))
-        results = []
-        for col in columns:
-            outbuf = zeros(shape=shape)
-            for i, asset in enumerate(assets):
-                data = self.panel.loc[asset, start_date:end_date, col]
-                data = data.reindex_axis(index).values
-                outbuf[:, i] = data
-            results.append(outbuf)
-        return results
+        return self.panel.loc[
+            list(assets),
+            start_dt:end_dt,
+            list(columns)
+        ].reindex(major_axis=cal[cal.slice_indexer(start_dt, end_dt)]).values.T
 
-    def spot_price(self, sid, day, colname):
+    def get_value(self, sid, dt, field):
         """
         Parameters
         ----------
@@ -817,7 +829,7 @@ class PanelDailyBarReader(DailyBarReader):
             The asset identifier.
         day : datetime64-like
             Midnight of the day for which data is requested.
-        colname : string
+        field : string
             The price field. e.g. ('open', 'high', 'low', 'close', 'volume')
 
         Returns
@@ -829,13 +841,13 @@ class PanelDailyBarReader(DailyBarReader):
             Returns -1 if the day is within the date range, but the price is
             0.
         """
-        return self.panel.loc[sid, day, colname]
+        return self.panel.loc[sid, dt, field]
 
-    def get_last_traded_dt(self, sid, dt):
+    def get_last_traded_dt(self, asset, dt):
         """
         Parameters
         ----------
-        sid : int
+        asset : zipline.asset.Asset
             The asset identifier.
         dt : datetime64-like
             Midnight of the day for which data is requested.
@@ -845,13 +857,14 @@ class PanelDailyBarReader(DailyBarReader):
         pd.Timestamp : The last know dt for the asset and dt;
                        NaT if no trade is found before the given dt.
         """
-        while dt in self.panel.major_axis:
-            freq = self.panel.major_axis.freq
-            if not isnull(self.panel.loc[sid, dt, 'close']):
-                return dt
-            dt -= freq
-        else:
+        try:
+            return self.panel.loc[int(asset), :dt, 'close'].last_valid_index()
+        except IndexError:
             return NaT
+
+    @property
+    def first_trading_day(self):
+        return self._first_trading_day
 
 
 class SQLiteAdjustmentWriter(object):
@@ -880,7 +893,7 @@ class SQLiteAdjustmentWriter(object):
                  overwrite=False):
         if isinstance(conn_or_path, sqlite3.Connection):
             self.conn = conn_or_path
-        elif isinstance(conn_or_path, str):
+        elif isinstance(conn_or_path, string_types):
             if overwrite:
                 try:
                     remove(conn_or_path)
@@ -982,13 +995,13 @@ class SQLiteAdjustmentWriter(object):
             - effective_date, the date in seconds on which to apply the ratio.
             - ratio, the ratio to apply to backwards looking pricing data.
         """
-        if dividends is None:
+        if dividends is None or dividends.empty:
             return DataFrame(np.array(
                 [],
                 dtype=[
                     ('sid', uint32),
                     ('effective_date', uint32),
-                    ('ratio',  float64),
+                    ('ratio', float64),
                 ],
             ))
         ex_dates = dividends.ex_date.values
@@ -1001,16 +1014,30 @@ class SQLiteAdjustmentWriter(object):
         equity_daily_bar_reader = self._equity_daily_bar_reader
 
         effective_dates = full(len(amounts), -1, dtype=int64)
+
         calendar = self._calendar
+
+        # Calculate locs against a tz-naive cal, as the ex_dates are tz-
+        # naive.
+        #
+        # TODO: A better approach here would be to localize ex_date to
+        # the tz of the calendar, but currently get_indexer does not
+        # preserve tz of the target when method='bfill', which throws
+        # off the comparison.
+        tz_naive_calendar = calendar.tz_localize(None)
+        day_locs = tz_naive_calendar.get_indexer(ex_dates, method='bfill')
+
         for i, amount in enumerate(amounts):
             sid = sids[i]
             ex_date = ex_dates[i]
-            day_loc = calendar.get_loc(ex_date, method='bfill')
+            day_loc = day_locs[i]
+
             prev_close_date = calendar[day_loc - 1]
+
             try:
-                prev_close = equity_daily_bar_reader.spot_price(
+                prev_close = equity_daily_bar_reader.get_value(
                     sid, prev_close_date, 'close')
-                if prev_close != 0.0:
+                if not isnull(prev_close):
                     ratio = 1.0 - amount / prev_close
                     ratios[i] = ratio
                     # only assign effective_date when data is found
@@ -1046,11 +1073,11 @@ class SQLiteAdjustmentWriter(object):
             dividend_payouts['ex_date'] = dividend_payouts['ex_date'].values.\
                 astype('datetime64[s]').astype(integer)
             dividend_payouts['record_date'] = \
-                dividend_payouts['record_date'].values.astype('datetime64[s]').\
-                astype(integer)
+                dividend_payouts['record_date'].values.\
+                astype('datetime64[s]').astype(integer)
             dividend_payouts['declared_date'] = \
-                dividend_payouts['declared_date'].values.astype('datetime64[s]').\
-                astype(integer)
+                dividend_payouts['declared_date'].values.\
+                astype('datetime64[s]').astype(integer)
             dividend_payouts['pay_date'] = \
                 dividend_payouts['pay_date'].values.astype('datetime64[s]').\
                 astype(integer)
@@ -1253,9 +1280,21 @@ class SQLiteAdjustmentReader(object):
     :class:`zipline.data.us_equity_pricing.SQLiteAdjustmentWriter`
     """
 
-    @preprocess(conn=coerce_string(sqlite3.connect))
+    @preprocess(conn=coerce_string_to_conn)
     def __init__(self, conn):
         self.conn = conn
+
+        # Given the tables in the adjustments.db file, dict which knows which
+        # col names contain dates that have been coerced into ints.
+        self._datetime_int_cols = {
+            'dividend_payouts': ('declared_date', 'ex_date', 'pay_date',
+                                 'record_date'),
+            'dividends': ('effective_date',),
+            'mergers': ('effective_date',),
+            'splits': ('effective_date',),
+            'stock_dividend_payouts': ('declared_date', 'ex_date', 'pay_date',
+                                       'record_date')
+        }
 
     def load_adjustments(self, columns, dates, assets):
         return load_adjustments_from_sqlite(
@@ -1323,3 +1362,49 @@ class SQLiteAdjustmentReader(object):
         c.close()
 
         return stock_divs
+
+    def unpack_db_to_component_dfs(self, convert_dates=False):
+        """Returns the set of known tables in the adjustments file in DataFrame
+        form.
+
+        Parameters
+        ----------
+        convert_dates : bool, optional
+            By default, dates are returned in seconds since EPOCH. If
+            convert_dates is True, all ints in date columns will be converted
+            to datetimes.
+
+        Returns
+        -------
+        dfs : dict{str->DataFrame}
+            Dictionary which maps table name to the corresponding DataFrame
+            version of the table, where all date columns have been coerced back
+            from int to datetime.
+        """
+
+        def _get_df_from_table(table_name, date_cols):
+
+            # Dates are stored in second resolution as ints in adj.db tables.
+            # Need to specifically convert them as UTC, not local time.
+            kwargs = (
+                {'parse_dates': {col: {'unit': 's', 'utc': True}
+                                 for col in date_cols}
+                 }
+                if convert_dates
+                else {}
+            )
+
+            return read_sql(
+                'select * from "{}"'.format(table_name),
+                self.conn,
+                index_col='index',
+                **kwargs
+            ).rename_axis(None)
+
+        return {
+            t_name: _get_df_from_table(
+                t_name,
+                date_cols
+            )
+            for t_name, date_cols in self._datetime_int_cols.items()
+        }

@@ -297,7 +297,6 @@ def handle_data(context, data):
 
     @parameterized.expand([("unspecified", ""),
                            ("none", "usecols=None"),
-                           ("empty", "usecols=[]"),
                            ("without date", "usecols=['Value']"),
                            ("with date", "usecols=('Value', 'Date')")])
     def test_usecols(self, testname, usecols):
@@ -325,30 +324,9 @@ def initialize(context):
     context.stocks = [sid(3766), sid(25317)]
 
 def handle_data(context, data):
-    if {should_have_data}:
-        try:
-            data.current("urban", "cpi")
-        except (KeyError, ValueError):
-            assert False
-    else:
-        try:
-            data.current("urban", "cpi")
-        except (KeyError, ValueError):
-            assert True
+    data.current("urban", "cpi")
         """
-
-        results = self.run_algo(
-            code.format(
-                usecols=usecols,
-                should_have_data=testname in [
-                    'none',
-                    'unspecified',
-                    'without date',
-                    'with date',
-                ],
-            )
-        )
-
+        results = self.run_algo(code.format(usecols=usecols))
         # 251 trading days in 2006
         self.assertEqual(len(results), 251)
 
@@ -417,6 +395,7 @@ def handle_data(context, data):
 
             algocode = """
 from pandas import Timestamp
+from pandas.tseries.tools import normalize_date
 from zipline.api import fetch_csv, record, sid, get_datetime
 
 def initialize(context):
@@ -432,7 +411,7 @@ def initialize(context):
     context.bar_count = 0
 
 def handle_data(context, data):
-    expected = context.expected_sids[get_datetime()]
+    expected = context.expected_sids[normalize_date(get_datetime())]
     actual = data.fetcher_assets
     for stk in expected:
         if stk not in actual:

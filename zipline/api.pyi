@@ -1,12 +1,15 @@
+import collections
 from zipline.assets import Asset, Equity, Future
 from zipline.assets.futures import FutureChain
+from zipline.finance.asset_restrictions import Restrictions
 from zipline.finance.cancel_policy import CancelPolicy
 from zipline.pipeline import Pipeline
 from zipline.protocol import Order
 from zipline.utils.events import EventRule
+from zipline.utils.security_list import SecurityList
 
 
-def attach_pipeline(pipeline, name, chunksize=None):
+def attach_pipeline(pipeline, name, chunks=None):
     """Register a pipeline to be computed at the start of each day.
 
     Parameters
@@ -15,10 +18,11 @@ def attach_pipeline(pipeline, name, chunksize=None):
         The pipeline to have computed.
     name : str
         The name of the pipeline.
-    chunksize : int, optional
+    chunks : int or iterator, optional
         The number of days to compute pipeline results for. Increasing
         this number will make it longer to get the first results but
-        may improve the total runtime of the simulation.
+        may improve the total runtime of the simulation. If an iterator
+        is passed, we will run in chunks based on values of the itereator.
 
     Returns
     -------
@@ -30,6 +34,23 @@ def attach_pipeline(pipeline, name, chunksize=None):
     :func:`zipline.api.pipeline_output`
     """
 
+def batch_order_target_percent(weights):
+    """Place orders towards a given portfolio of weights.
+
+    Parameters
+    ----------
+    weights : collections.Mapping[Asset -> float]
+
+    Returns
+    -------
+    order_ids : pd.Series[Asset -> str]
+        The unique identifiers for the orders that were placed.
+
+    See Also
+    --------
+    :func:`zipline.api.order_target_percent`
+    """
+
 def cancel_order(order_param):
     """Cancel an open order.
 
@@ -37,6 +58,30 @@ def cancel_order(order_param):
     ----------
     order_param : str or Order
         The order_id or order object to cancel.
+    """
+
+def continuous_future(root_symbol_str, offset=0, roll='volume', adjustment='mul'):
+    """Create a specifier for a continuous contract.
+
+    Parameters
+    ----------
+    root_symbol_str : str
+        The root symbol for the future chain.
+
+    offset : int, optional
+        The distance from the primary contract. Default is 0.
+
+    roll_style : str, optional
+        How rolls are determined. Default is 'volume'.
+
+    adjustment : str, optional
+        Method for adjusting lookback prices between rolls. Options are
+        'mul', 'add', and None. Default is 'mul'.
+
+    Returns
+    -------
+    continuous_future : ContinuousFuture
+        The continuous future specifier.
     """
 
 def fetch_csv(url, pre_func=None, post_func=None, date_column='date', date_format=None, timezone='UTC', symbol=None, mask=True, symbol_column=None, special_params_checker=None, **kwargs):
@@ -83,29 +128,6 @@ def fetch_csv(url, pre_func=None, post_func=None, date_column='date', date_forma
         A requests source that will pull data from the url specified.
     """
 
-def future_chain(root_symbol, as_of_date=None):
-    """Look up a future chain with the specified parameters.
-
-    Parameters
-    ----------
-    root_symbol : str
-        The root symbol of a future chain.
-    as_of_date : datetime.datetime or pandas.Timestamp or str, optional
-        Date at which the chain determination is rooted. I.e. the
-        existing contract whose notice date is first after this date is
-        the primary contract, etc.
-
-    Returns
-    -------
-    chain : FutureChain
-        The future chain matching the specified parameters.
-
-    Raises
-    ------
-    RootSymbolNotFound
-        If a future chain could not be found for the given root symbol.
-    """
-
 def future_symbol(symbol):
     """Lookup a futures contract with a given symbol.
 
@@ -126,17 +148,18 @@ def future_symbol(symbol):
     """
 
 def get_datetime(tz=None):
-    """Returns the current simulation datetime.
+    """
+Returns the current simulation datetime.
 
-    Parameters
-    ----------
-    tz : tzinfo or str, optional
-        The timezone to return the datetime in. This defaults to utc.
+Parameters
+----------
+tz : tzinfo or str, optional
+    The timezone to return the datetime in. This defaults to utc.
 
-    Returns
-    -------
-    dt : datetime
-        The current simulation datetime converted to ``tz``.
+Returns
+-------
+dt : datetime
+    The current simulation datetime converted to ``tz``.
     """
 
 def get_environment(field='platform'):
@@ -217,8 +240,9 @@ def order(asset, amount, limit_price=None, stop_price=None, style=None):
 
     Returns
     -------
-    order_id : str
-        The unique identifier for this order.
+    order_id : str or None
+        The unique identifier for this order, or None if no order was
+        placed.
 
     Notes
     -----
@@ -334,7 +358,7 @@ def order_target_percent(asset, target, limit_price=None, stop_price=None, style
     ----------
     asset : Asset
         The asset that this order is for.
-    percent : float
+    target : float
         The desired percentage of the porfolio value to allocate to
         ``asset``. This is specified as a decimal, for example:
         0.50 means 50%.
@@ -508,7 +532,7 @@ def record(*args, **kwargs):
     :func:`~zipline.run_algorithm`.
     """
 
-def schedule_function(func, date_rule=None, time_rule=None, half_days=True):
+def schedule_function(func, date_rule=None, time_rule=None, half_days=True, calendar=None):
     """Schedules a function to be called according to some timed rules.
 
     Parameters
@@ -526,6 +550,19 @@ def schedule_function(func, date_rule=None, time_rule=None, half_days=True):
     --------
     :class:`zipline.api.date_rules`
     :class:`zipline.api.time_rules`
+    """
+
+def set_asset_restrictions(restrictions, on_error='fail'):
+    """Set a restriction on which assets can be ordered.
+
+    Parameters
+    ----------
+    restricted_list : Restrictions
+        An object providing information about restricted assets.
+
+    See Also
+    --------
+    zipline.finance.asset_restrictions.Restrictions
     """
 
 def set_benchmark(benchmark):
@@ -571,16 +608,16 @@ def set_commission(commission):
     :class:`zipline.finance.commission.PerDollar`
     """
 
-def set_do_not_order_list(restricted_list):
+def set_do_not_order_list(restricted_list, on_error='fail'):
     """Set a restriction on which assets can be ordered.
 
     Parameters
     ----------
-    restricted_list : container[Asset]
+    restricted_list : container[Asset], SecurityList
         The assets that cannot be ordered.
     """
 
-def set_long_only():
+def set_long_only(on_error='fail'):
     """Set a rule specifying that this algorithm cannot take short
     positions.
     """
@@ -595,7 +632,7 @@ def set_max_leverage(max_leverage):
         be no maximum.
     """
 
-def set_max_order_count(max_count):
+def set_max_order_count(max_count, on_error='fail'):
     """Set a limit on the number of orders that can be placed in a single
     day.
 
@@ -605,7 +642,7 @@ def set_max_order_count(max_count):
         The maximum number of orders that can be placed on any single day.
     """
 
-def set_max_order_size(asset=None, max_shares=None, max_notional=None):
+def set_max_order_size(asset=None, max_shares=None, max_notional=None, on_error='fail'):
     """Set a limit on the number of shares and/or dollar value of any single
     order placed for sid.  Limits are treated as absolute values and are
     enforced at the time that the algo attempts to place an order for sid.
@@ -624,7 +661,7 @@ def set_max_order_size(asset=None, max_shares=None, max_notional=None):
         The maximum value that can be ordered at one time.
     """
 
-def set_max_position_size(asset=None, max_shares=None, max_notional=None):
+def set_max_position_size(asset=None, max_shares=None, max_notional=None, on_error='fail'):
     """Set a limit on the number of shares and/or dollar value held for the
     given sid. Limits are treated as absolute values and are enforced at
     the time that the algo attempts to place an order for sid. This means

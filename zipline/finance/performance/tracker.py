@@ -98,7 +98,6 @@ class PerformanceTracker(object):
         self.emission_rate = sim_params.emission_rate
 
         self.position_tracker = PositionTracker(
-            asset_finder=env.asset_finder,
             data_frequency=self.sim_params.data_frequency
         )
 
@@ -141,7 +140,6 @@ class PerformanceTracker(object):
             keep_orders=False,
             # don't serialize positions for cumulative period
             serialize_positions=False,
-            asset_finder=self.asset_finder,
             name="Cumulative"
         )
         self.cumulative_performance.position_tracker = self.position_tracker
@@ -157,7 +155,6 @@ class PerformanceTracker(object):
             keep_transactions=True,
             keep_orders=True,
             serialize_positions=True,
-            asset_finder=self.asset_finder,
             name="Daily"
         )
         self.todays_performance.position_tracker = self.position_tracker
@@ -238,8 +235,16 @@ class PerformanceTracker(object):
 
         return _dict
 
+    def prepare_capital_change(self, is_interday):
+        self.cumulative_performance.initialize_subperiod_divider()
+
+        if not is_interday:
+            # Change comes in the middle of day
+            self.todays_performance.initialize_subperiod_divider()
+
     def process_capital_change(self, capital_change_amount, is_interday):
-        self.cumulative_performance.subdivide_period(capital_change_amount)
+        self.cumulative_performance.set_current_subperiod_starting_values(
+            capital_change_amount)
 
         if is_interday:
             # Change comes between days
@@ -247,7 +252,8 @@ class PerformanceTracker(object):
                 capital_change_amount)
         else:
             # Change comes in the middle of day
-            self.todays_performance.subdivide_period(capital_change_amount)
+            self.todays_performance.set_current_subperiod_starting_values(
+                capital_change_amount)
 
     def process_transaction(self, transaction):
         self.txn_count += 1
@@ -266,10 +272,10 @@ class PerformanceTracker(object):
         self.todays_performance.record_order(event)
 
     def process_commission(self, commission):
-        sid = commission['sid']
+        asset = commission['asset']
         cost = commission['cost']
 
-        self.position_tracker.handle_commission(sid, cost)
+        self.position_tracker.handle_commission(asset, cost)
         self.cumulative_performance.handle_commission(cost)
         self.todays_performance.handle_commission(cost)
 
@@ -454,7 +460,7 @@ class PerformanceTracker(object):
             data=self.cumulative_risk_metrics.algorithm_returns_cont)
         acl = self.cumulative_risk_metrics.algorithm_cumulative_leverages
 
-        self.risk_report = risk.RiskReport(
+        risk_report = risk.RiskReport(
             ars,
             self.sim_params,
             benchmark_returns=bms,
@@ -463,5 +469,4 @@ class PerformanceTracker(object):
             treasury_curves=self.treasury_curves,
         )
 
-        risk_dict = self.risk_report.to_dict()
-        return risk_dict
+        return risk_report.to_dict()

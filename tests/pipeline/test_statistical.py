@@ -314,7 +314,7 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
         `RollingLinearRegressionOfReturns` raise the proper exception when
         given a nonexistent target asset.
         """
-        my_asset = Equity(0)
+        my_asset = Equity(0, exchange="TEST")
         start_date = self.pipeline_start_date
         end_date = self.pipeline_end_date
         run_pipeline = self.run_pipeline
@@ -361,6 +361,30 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
                     start_date,
                     end_date,
                 )
+
+    def test_require_length_greater_than_one(self):
+        my_asset = Equity(0, exchange="TEST")
+
+        with self.assertRaises(ValueError):
+            RollingPearsonOfReturns(
+                target=my_asset,
+                returns_length=3,
+                correlation_length=1,
+            )
+
+        with self.assertRaises(ValueError):
+            RollingSpearmanOfReturns(
+                target=my_asset,
+                returns_length=3,
+                correlation_length=1,
+            )
+
+        with self.assertRaises(ValueError):
+            RollingLinearRegressionOfReturns(
+                target=my_asset,
+                returns_length=3,
+                regression_length=1,
+            )
 
 
 class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
@@ -581,7 +605,7 @@ class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
                 regression_length=regression_length,
             )
 
-    @parameter_space(correlation_length=[1, 2, 3, 4])
+    @parameter_space(correlation_length=[2, 3, 4])
     def test_factor_correlation_methods_two_factors(self, correlation_length):
         """
         Tests for `Factor.pearsonr` and `Factor.spearmanr` when passed another
@@ -682,7 +706,7 @@ class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
         )
         assert_frame_equal(spearman_results, expected_spearman_results)
 
-    @parameter_space(regression_length=[1, 2, 3, 4])
+    @parameter_space(regression_length=[2, 3, 4])
     def test_factor_regression_method_two_factors(self, regression_length):
         """
         Tests for `Factor.linear_regression` when passed another 2D factor

@@ -1,31 +1,41 @@
+#
+# Copyright 2016 Quantopian, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from textwrap import dedent
-
-from numbers import Real
 
 from nose_parameterized import parameterized
 import numpy as np
 from numpy import nan
-from numpy.testing import assert_almost_equal
 import pandas as pd
 from six import iteritems
 
 from zipline import TradingAlgorithm
-from zipline._protocol import handle_non_market_minutes
+from zipline._protocol import handle_non_market_minutes, BarData
 from zipline.assets import Asset
-from zipline.data.data_portal import DailyHistoryAggregator
 from zipline.errors import (
     HistoryInInitialize,
     HistoryWindowStartsBeforeData,
 )
 from zipline.finance.trading import SimulationParameters
-from zipline.protocol import BarData
+from zipline.finance.asset_restrictions import NoRestrictions
 from zipline.testing import (
     create_minute_df_for_asset,
     str_to_seconds,
     MockDailyBarReader,
 )
 from zipline.testing.fixtures import (
-    WithBcolzEquityMinuteBarReader,
+    WithCreateBarData,
     WithDataPortal,
     ZiplineTestCase,
     alias,
@@ -33,12 +43,11 @@ from zipline.testing.fixtures import (
 
 
 OHLC = ['open', 'high', 'low', 'close']
-OHLCV = OHLC + ['volume']
 OHLCP = OHLC + ['price']
 ALL_FIELDS = OHLCP + ['volume']
 
 
-class WithHistory(WithDataPortal):
+class WithHistory(WithCreateBarData, WithDataPortal):
     TRADING_START_DT = TRADING_ENV_MIN_DATE = START_DATE = pd.Timestamp(
         '2014-01-03',
         tz='UTC',
@@ -113,42 +122,50 @@ class WithHistory(WithDataPortal):
                 1: {
                     'start_date': pd.Timestamp('2014-01-03', tz='UTC'),
                     'end_date': cls.TRADING_END_DT,
-                    'symbol': 'ASSET1'
+                    'symbol': 'ASSET1',
+                    'exchange': "TEST",
                 },
                 2: {
                     'start_date': jan_5_2015,
                     'end_date': day_after_12312015,
-                    'symbol': 'ASSET2'
+                    'symbol': 'ASSET2',
+                    'exchange': "TEST",
                 },
                 3: {
                     'start_date': jan_5_2015,
                     'end_date': day_after_12312015,
-                    'symbol': 'ASSET3'
+                    'symbol': 'ASSET3',
+                    'exchange': "TEST",
                 },
                 cls.SPLIT_ASSET_SID: {
                     'start_date': jan_5_2015,
                     'end_date': day_after_12312015,
-                    'symbol': 'SPLIT_ASSET'
+                    'symbol': 'SPLIT_ASSET',
+                    'exchange': "TEST",
                 },
                 cls.DIVIDEND_ASSET_SID: {
                     'start_date': jan_5_2015,
                     'end_date': day_after_12312015,
-                    'symbol': 'DIVIDEND_ASSET'
+                    'symbol': 'DIVIDEND_ASSET',
+                    'exchange': "TEST",
                 },
                 cls.MERGER_ASSET_SID: {
                     'start_date': jan_5_2015,
                     'end_date': day_after_12312015,
-                    'symbol': 'MERGER_ASSET'
+                    'symbol': 'MERGER_ASSET',
+                    'exchange': "TEST",
                 },
                 cls.HALF_DAY_TEST_ASSET_SID: {
                     'start_date': pd.Timestamp('2014-07-02', tz='UTC'),
                     'end_date': day_after_12312015,
-                    'symbol': 'HALF_DAY_TEST_ASSET'
+                    'symbol': 'HALF_DAY_TEST_ASSET',
+                    'exchange': "TEST",
                 },
                 cls.SHORT_ASSET_SID: {
                     'start_date': pd.Timestamp('2015-01-05', tz='UTC'),
                     'end_date': pd.Timestamp('2015-01-06', tz='UTC'),
-                    'symbol': 'SHORT_ASSET'
+                    'symbol': 'SHORT_ASSET',
+                    'exchange': "TEST",
                 }
             },
             orient='index',
@@ -235,7 +252,9 @@ class WithHistory(WithDataPortal):
         fields = fields if fields is not None else ALL_FIELDS
         assets = assets if assets is not None else [self.ASSET2, self.ASSET3]
 
-        bar_data = BarData(self.data_portal, lambda: dt, mode)
+        bar_data = self.create_bardata(
+            simulation_dt_func=lambda: dt,
+        )
         check_internal_consistency(
             bar_data, assets, fields, 10, freq
         )
@@ -687,7 +706,9 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         )[0:60]
 
         for idx, minute in enumerate(minutes):
-            bar_data = BarData(self.data_portal, lambda: minute, 'minute')
+            bar_data = self.create_bardata(
+                lambda: minute,
+            )
             check_internal_consistency(
                 bar_data, [self.ASSET2, self.ASSET3], ALL_FIELDS, 10, '1m'
             )
@@ -748,11 +769,12 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
             )
         )[1]
 
-        midnight_bar_data = \
-            BarData(self.data_portal, lambda: midnight, 'minute')
-
-        yesterday_bar_data = \
-            BarData(self.data_portal, lambda: last_minute, 'minute')
+        midnight_bar_data = self.create_bardata(
+            lambda: midnight,
+        )
+        yesterday_bar_data = self.create_bardata(
+            lambda: last_minute
+        )
 
         with handle_non_market_minutes(midnight_bar_data):
             for field in ALL_FIELDS:
@@ -769,7 +791,9 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         )[0:60]
 
         for idx, minute in enumerate(minutes):
-            bar_data = BarData(self.data_portal, lambda: minute, 'minute')
+            bar_data = self.create_bardata(
+                lambda: minute
+            )
             check_internal_consistency(
                 bar_data, self.SHORT_ASSET, ALL_FIELDS, 30, '1m'
             )
@@ -778,7 +802,13 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         data_portal = self.make_data_portal()
 
         # choose a window that contains the last minute of the asset
-        bar_data = BarData(data_portal, lambda: minutes[15], 'minute')
+        bar_data = BarData(
+            data_portal=data_portal,
+            simulation_dt_func=lambda: minutes[15],
+            data_frequency='minute',
+            restrictions=NoRestrictions(),
+            trading_calendar=self.trading_calendar,
+        )
 
         #                             close  high  low  open  price  volume
         # 2015-01-06 20:47:00+00:00    768   770  767   769    768   76800
@@ -990,7 +1020,9 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
     def test_passing_iterable_to_history_regular_hours(self):
         # regular hours
         current_dt = pd.Timestamp("2015-01-06 9:45", tz='US/Eastern')
-        bar_data = BarData(self.data_portal, lambda: current_dt, "minute")
+        bar_data = self.create_bardata(
+            lambda: current_dt,
+        )
 
         bar_data.history(pd.Index([self.ASSET1, self.ASSET2]),
                          "high", 5, "1m")
@@ -998,7 +1030,9 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
     def test_passing_iterable_to_history_bts(self):
         # before market hours
         current_dt = pd.Timestamp("2015-01-07 8:45", tz='US/Eastern')
-        bar_data = BarData(self.data_portal, lambda: current_dt, "minute")
+        bar_data = self.create_bardata(
+            lambda: current_dt,
+        )
 
         with handle_non_market_minutes(bar_data):
             bar_data.history(pd.Index([self.ASSET1, self.ASSET2]),
@@ -1007,7 +1041,9 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
     def test_overnight_adjustments(self):
         # Should incorporate adjustments on midnight 01/06
         current_dt = pd.Timestamp('2015-01-06 8:45', tz='US/Eastern')
-        bar_data = BarData(self.data_portal, lambda: current_dt, 'minute')
+        bar_data = self.create_bardata(
+            lambda: current_dt,
+        )
 
         adj_expected = {
             'open': np.arange(8381, 8391) / 4.0,
@@ -1192,8 +1228,8 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                     self.assertEqual(window[0], 391)
                     self.assertEqual(window[1], 781)
                 elif field == 'volume':
-                    self.assertEqual(window[0], 39100)
-                    self.assertEqual(window[1], 78100)
+                    self.assertEqual(window[0], 7663500)
+                    self.assertEqual(window[1], 22873500)
 
                 last_val = -1
 
@@ -1258,8 +1294,8 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                 self.assertEqual(window[0], 781)
                 self.assertEqual(window[1], 1171)
             elif field == 'volume':
-                self.assertEqual(window[0], 78100)
-                self.assertEqual(window[1], 117100)
+                self.assertEqual(window[0], 22873500)
+                self.assertEqual(window[1], 38083500)
 
             last_val = -1
 
@@ -1315,7 +1351,14 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                                            format(field, minute))
 
 
+class NoPrefetchMinuteEquityHistoryTestCase(MinuteEquityHistoryTestCase):
+    DATA_PORTAL_MINUTE_HISTORY_PREFETCH = 0
+    DATA_PORTAL_DAILY_HISTORY_PREFETCH = 0
+
+
 class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
+    CREATE_BARDATA_DATA_FREQUENCY = 'daily'
+
     @classmethod
     def make_equity_daily_bar_data(cls):
         yield 1, cls.create_df_for_asset(
@@ -1378,7 +1421,9 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         )
 
         for idx, day in enumerate(days):
-            bar_data = BarData(self.data_portal, lambda: day, 'daily')
+            bar_data = self.create_bardata(
+                simulation_dt_func=lambda: day,
+            )
             check_internal_consistency(
                 bar_data, [self.ASSET2, self.ASSET3], ALL_FIELDS, 10, '1d'
             )
@@ -1419,9 +1464,9 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         # asset1 ends on 2016-01-30
         # asset2 ends on 2015-12-13
 
-        bar_data = BarData(self.data_portal,
-                           lambda: pd.Timestamp('2016-01-06', tz='UTC'),
-                           'daily')
+        bar_data = self.create_bardata(
+            simulation_dt_func=lambda: pd.Timestamp('2016-01-06', tz='UTC'),
+        )
 
         for field in OHLCP:
             window = bar_data.history(
@@ -1459,7 +1504,9 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
 
         # days has 1/7, 1/8
         for idx, day in enumerate(days):
-            bar_data = BarData(self.data_portal, lambda: day, 'daily')
+            bar_data = self.create_bardata(
+                simulation_dt_func=lambda: day,
+            )
             check_internal_consistency(
                 bar_data, self.SHORT_ASSET, ALL_FIELDS, 2, '1d'
             )
@@ -1611,9 +1658,10 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         # asset1 ends on 2016-01-30
         # asset2 ends on 2016-01-04
 
-        bar_data = BarData(self.data_portal,
-                           lambda: pd.Timestamp('2016-01-06 16:00', tz='UTC'),
-                           'daily')
+        bar_data = self.create_bardata(
+            simulation_dt_func=lambda:
+            pd.Timestamp('2016-01-06 16:00', tz='UTC'),
+        )
 
         for field in OHLCP:
             window = bar_data.history(
@@ -1713,251 +1761,65 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         np.testing.assert_almost_equal(window_1[self.ASSET2].values,
                                        window_2[self.ASSET2].values)
 
+    def test_history_window_out_of_order_dates(self):
+        """
+        Use a history window with non-monotonically increasing dates.
+        A scenario which does not occur during simulations, but useful
+        for using a history loader in a notebook.
+        """
 
-class MinuteToDailyAggregationTestCase(WithBcolzEquityMinuteBarReader,
-                                       ZiplineTestCase):
-
-    #    March 2016
-    # Su Mo Tu We Th Fr Sa
-    #        1  2  3  4  5
-    #  6  7  8  9 10 11 12
-    # 13 14 15 16 17 18 19
-    # 20 21 22 23 24 25 26
-    # 27 28 29 30 31
-
-    TRADING_ENV_MIN_DATE = START_DATE = pd.Timestamp(
-        '2016-03-01', tz='UTC',
-    )
-    TRADING_ENV_MAX_DATE = END_DATE = pd.Timestamp(
-        '2016-03-31', tz='UTC',
-    )
-    ASSET_FINDER_EQUITY_SIDS = 1, 2
-
-    minutes = pd.date_range('2016-03-15 9:31',
-                            '2016-03-15 9:36',
-                            freq='min',
-                            tz='US/Eastern').tz_convert('UTC')
-
-    @classmethod
-    def make_equity_minute_bar_data(cls):
-        # sid data is created so that at least one high is lower than a
-        # previous high, and the inverse for low
-        yield 1, pd.DataFrame(
-            {
-                'open': [nan, 103.50, 102.50, 104.50, 101.50, nan],
-                'high': [nan, 103.90, 102.90, 104.90, 101.90, nan],
-                'low': [nan, 103.10, 102.10, 104.10, 101.10, nan],
-                'close': [nan, 103.30, 102.30, 104.30, 101.30, nan],
-                'volume': [0, 1003, 1002, 1004, 1001, 0]
-            },
-            index=cls.minutes,
-        )
-        # sid 2 is included to provide data on different bars than sid 1,
-        # as will as illiquidty mid-day
-        yield 2, pd.DataFrame(
-            {
-                'open': [201.50, nan, 204.50, nan, 200.50, 202.50],
-                'high': [201.90, nan, 204.90, nan, 200.90, 202.90],
-                'low': [201.10, nan, 204.10, nan, 200.10, 202.10],
-                'close': [201.30, nan, 203.50, nan, 200.30, 202.30],
-                'volume': [2001, 0, 2004, 0, 2000, 2002],
-            },
-            index=cls.minutes,
+        window_1 = self.data_portal.get_history_window(
+            [self.ASSET1],
+            pd.Timestamp('2014-02-07', tz='UTC'),
+            4,
+            "1d",
+            "close"
         )
 
-    expected_values = {
-        1: pd.DataFrame(
-            {
-                'open': [nan, 103.50, 103.50, 103.50, 103.50, 103.50],
-                'high': [nan, 103.90, 103.90, 104.90, 104.90, 104.90],
-                'low': [nan, 103.10, 102.10, 102.10, 101.10, 101.10],
-                'close': [nan, 103.30, 102.30, 104.30, 101.30, 101.30],
-                'volume': [0, 1003, 2005, 3009, 4010, 4010]
-            },
-            index=minutes,
-        ),
-        2: pd.DataFrame(
-            {
-                'open': [201.50, 201.50, 201.50, 201.50, 201.50, 201.50],
-                'high': [201.90, 201.90, 204.90, 204.90, 204.90, 204.90],
-                'low': [201.10, 201.10, 201.10, 201.10, 200.10, 200.10],
-                'close': [201.30, 201.30, 203.50, 203.50, 200.30, 202.30],
-                'volume': [2001, 2001, 4005, 4005, 6005, 8007],
-            },
-            index=minutes,
-        )
-    }
-
-    @classmethod
-    def init_class_fixtures(cls):
-        super(MinuteToDailyAggregationTestCase, cls).init_class_fixtures()
-
-        cls.EQUITIES = {
-            1: cls.env.asset_finder.retrieve_asset(1),
-            2: cls.env.asset_finder.retrieve_asset(2)
-        }
-
-    def init_instance_fixtures(self):
-        super(MinuteToDailyAggregationTestCase, self).init_instance_fixtures()
-        # Set up a fresh data portal for each test, since order of calling
-        # needs to be tested.
-        self.equity_daily_aggregator = DailyHistoryAggregator(
-            self.trading_calendar.schedule.market_open,
-            self.bcolz_equity_minute_bar_reader,
+        window_2 = self.data_portal.get_history_window(
+            [self.ASSET1],
+            pd.Timestamp('2014-02-05', tz='UTC'),
+            4,
+            "1d",
+            "close"
         )
 
-    @parameterized.expand([
-        ('open_sid_1', 'open', 1),
-        ('high_1', 'high', 1),
-        ('low_1', 'low', 1),
-        ('close_1', 'close', 1),
-        ('volume_1', 'volume', 1),
-        ('open_2', 'open', 2),
-        ('high_2', 'high', 2),
-        ('low_2', 'low', 2),
-        ('close_2', 'close', 2),
-        ('volume_2', 'volume', 2),
+        window_3 = self.data_portal.get_history_window(
+            [self.ASSET1],
+            pd.Timestamp('2014-02-07', tz='UTC'),
+            4,
+            "1d",
+            "close"
+        )
 
-    ])
-    def test_contiguous_minutes_individual(self, name, field, sid):
-        # First test each minute in order.
-        method_name = field + 's'
-        results = []
-        repeat_results = []
-        asset = self.EQUITIES[sid]
-        for minute in self.minutes:
-            value = getattr(self.equity_daily_aggregator, method_name)(
-                [asset], minute)[0]
-            # Prevent regression on building an array when scalar is intended.
-            self.assertIsInstance(value, Real)
-            results.append(value)
+        window_4 = self.data_portal.get_history_window(
+            [self.ASSET1],
+            pd.Timestamp('2014-01-22', tz='UTC'),
+            4,
+            "1d",
+            "close"
+        )
 
-            # Call a second time with the same dt, to prevent regression
-            # against case where crossed start and end dts caused a crash
-            # instead of the last value.
-            value = getattr(self.equity_daily_aggregator, method_name)(
-                [asset], minute)[0]
-            # Prevent regression on building an array when scalar is intended.
-            self.assertIsInstance(value, Real)
-            repeat_results.append(value)
+        # Calling 02-07 after resetting the window should not affect the
+        # results.
+        np.testing.assert_almost_equal(window_1.values, window_3.values)
 
-        assert_almost_equal(results, self.expected_values[asset][field],
-                            err_msg='sid={0} field={1}'.format(asset, field))
-        assert_almost_equal(repeat_results, self.expected_values[asset][field],
-                            err_msg='sid={0} field={1}'.format(asset, field))
+        offsets = np.arange(4)
 
-    @parameterized.expand([
-        ('open_sid_1', 'open', 1),
-        ('high_1', 'high', 1),
-        ('low_1', 'low', 1),
-        ('close_1', 'close', 1),
-        ('volume_1', 'volume', 1),
-        ('open_2', 'open', 2),
-        ('high_2', 'high', 2),
-        ('low_2', 'low', 2),
-        ('close_2', 'close', 2),
-        ('volume_2', 'volume', 2),
+        def assert_window_prices(window, starting_price):
+            np.testing.assert_almost_equal(window.loc[:, self.ASSET1],
+                                           starting_price + offsets)
 
-    ])
-    def test_skip_minutes_individual(self, name, field, sid):
-        # Test skipping minutes, to exercise backfills.
-        # Tests initial backfill and mid day backfill.
-        method_name = field + 's'
-        for i in [1, 5]:
-            minute = self.minutes[i]
-            asset = self.EQUITIES[sid]
-            value = getattr(self.equity_daily_aggregator, method_name)(
-                [asset], minute)[0]
-            # Prevent regression on building an array when scalar is intended.
-            self.assertIsInstance(value, Real)
-            assert_almost_equal(value,
-                                self.expected_values[sid][field][i],
-                                err_msg='sid={0} field={1} dt={2}'.format(
-                                    sid, field, minute))
+        # Window 1 starts on the 23rd day of data for ASSET 1.
+        assert_window_prices(window_1, 23)
+        # Window 2 starts on the 21st day of data for ASSET 1.
+        assert_window_prices(window_2, 21)
+        # Window 3 starts on the 23rd day of data for ASSET 1.
+        assert_window_prices(window_3, 23)
+        # Window 4 starts on the 11th day of data for ASSET 1.
+        assert_window_prices(window_4, 11)
 
-            # Call a second time with the same dt, to prevent regression
-            # against case where crossed start and end dts caused a crash
-            # instead of the last value.
-            value = getattr(self.equity_daily_aggregator, method_name)(
-                [asset], minute)[0]
-            # Prevent regression on building an array when scalar is intended.
-            self.assertIsInstance(value, Real)
-            assert_almost_equal(value,
-                                self.expected_values[sid][field][i],
-                                err_msg='sid={0} field={1} dt={2}'.format(
-                                    sid, field, minute))
 
-    @parameterized.expand(OHLCV)
-    def test_contiguous_minutes_multiple(self, field):
-        # First test each minute in order.
-        method_name = field + 's'
-        assets = sorted(self.EQUITIES.values())
-        results = {asset: [] for asset in assets}
-        repeat_results = {asset: [] for asset in assets}
-        for minute in self.minutes:
-            values = getattr(self.equity_daily_aggregator, method_name)(
-                assets, minute)
-            for j, asset in enumerate(assets):
-                value = values[j]
-                # Prevent regression on building an array when scalar is
-                # intended.
-                self.assertIsInstance(value, Real)
-                results[asset].append(value)
-
-            # Call a second time with the same dt, to prevent regression
-            # against case where crossed start and end dts caused a crash
-            # instead of the last value.
-            values = getattr(self.equity_daily_aggregator, method_name)(
-                assets, minute)
-            for j, asset in enumerate(assets):
-                value = values[j]
-                # Prevent regression on building an array when scalar is
-                # intended.
-                self.assertIsInstance(value, Real)
-                repeat_results[asset].append(value)
-        for asset in assets:
-            assert_almost_equal(results[asset],
-                                self.expected_values[asset][field],
-                                err_msg='sid={0} field={1}'.format(
-                                    asset, field))
-            assert_almost_equal(repeat_results[asset],
-                                self.expected_values[asset][field],
-                                err_msg='sid={0} field={1}'.format(
-                                    asset, field))
-
-    @parameterized.expand(OHLCV)
-    def test_skip_minutes_multiple(self, field):
-        # Test skipping minutes, to exercise backfills.
-        # Tests initial backfill and mid day backfill.
-        method_name = field + 's'
-        assets = sorted(self.EQUITIES.values())
-        for i in [1, 5]:
-            minute = self.minutes[i]
-            values = getattr(self.equity_daily_aggregator, method_name)(
-                assets, minute)
-            for j, asset in enumerate(assets):
-                value = values[j]
-                # Prevent regression on building an array when scalar is
-                # intended.
-                self.assertIsInstance(value, Real)
-                assert_almost_equal(
-                    value,
-                    self.expected_values[asset][field][i],
-                    err_msg='sid={0} field={1} dt={2}'.format(
-                        asset, field, minute))
-
-            # Call a second time with the same dt, to prevent regression
-            # against case where crossed start and end dts caused a crash
-            # instead of the last value.
-            values = getattr(self.equity_daily_aggregator, method_name)(
-                assets, minute)
-            for j, asset in enumerate(assets):
-                value = values[j]
-                # Prevent regression on building an array when scalar is
-                # intended.
-                self.assertIsInstance(value, Real)
-                assert_almost_equal(
-                    value,
-                    self.expected_values[asset][field][i],
-                    err_msg='sid={0} field={1} dt={2}'.format(
-                        asset, field, minute))
+class NoPrefetchDailyEquityHistoryTestCase(DailyEquityHistoryTestCase):
+    DATA_PORTAL_MINUTE_HISTORY_PREFETCH = 0
+    DATA_PORTAL_DAILY_HISTORY_PREFETCH = 0

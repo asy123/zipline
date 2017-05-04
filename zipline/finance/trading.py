@@ -20,11 +20,15 @@ from six import string_types
 from sqlalchemy import create_engine
 
 from zipline.assets import AssetDBWriter, AssetFinder
+from zipline.assets.continuous_futures import CHAIN_PREDICATES
 from zipline.data.loader import load_market_data
 from zipline.utils.calendars import get_calendar
 from zipline.utils.memoize import remember_last
 
 log = logbook.Logger('Trading')
+
+
+DEFAULT_CAPITAL_BASE = 1e5
 
 
 class TradingEnvironment(object):
@@ -80,7 +84,8 @@ class TradingEnvironment(object):
         bm_symbol='^GSPC',
         exchange_tz="US/Eastern",
         trading_calendar=None,
-        asset_db_path=':memory:'
+        asset_db_path=':memory:',
+        future_chain_predicates=CHAIN_PREDICATES,
     ):
 
         self.bm_symbol = bm_symbol
@@ -99,14 +104,16 @@ class TradingEnvironment(object):
         self.exchange_tz = exchange_tz
 
         if isinstance(asset_db_path, string_types):
-            asset_db_path = 'sqlite:///%s' % asset_db_path
+            asset_db_path = 'sqlite:///' + asset_db_path
             self.engine = engine = create_engine(asset_db_path)
         else:
             self.engine = engine = asset_db_path
 
         if engine is not None:
             AssetDBWriter(engine).init_db()
-            self.asset_finder = AssetFinder(engine)
+            self.asset_finder = AssetFinder(
+                engine,
+                future_chain_predicates=future_chain_predicates)
         else:
             self.asset_finder = None
 
@@ -124,7 +131,7 @@ class TradingEnvironment(object):
 class SimulationParameters(object):
     def __init__(self, start_session, end_session,
                  trading_calendar,
-                 capital_base=10e3,
+                 capital_base=DEFAULT_CAPITAL_BASE,
                  emission_rate='daily',
                  data_frequency='daily',
                  arena='backtest'):
